@@ -9,6 +9,8 @@ import torch.optim as optim
 import torch.nn.functional as F
 import argparse
 import torch.utils.data.sampler as sampler
+from fastai.vision import models
+
 from tqdm import tqdm
 
 from create_dataset import *
@@ -17,6 +19,7 @@ from torch.autograd import Variable
 from datetime import datetime
 
 from gradient_logger import GradientLogger
+from resnet_unet import unet_learner_without_skip_connections
 
 torch.backends.cudnn.benchmark = True   # may speed up training if input sizes do not vary
 
@@ -42,7 +45,6 @@ def inspect_gpu_tensors():
         except:
             pass
     return l
-
 
 class SegNet(nn.Module):
     def __init__(self):
@@ -335,11 +337,17 @@ class SegNet(nn.Module):
             gradient_logger.write_grad_metrics(epoch)
 
 
+
+
+
 # define model, optimiser and scheduler
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 cleanup_gpu_memory_every_batch = True
-SegNet_MTAN = SegNet().to(device)
-optimizer = optim.Adam(SegNet_MTAN.parameters(), lr=1e-4)
+
+pretrained = False
+resnet_unet = unet_learner_without_skip_connections(64, device, models.resnet34, pretrained=pretrained, metrics=None)
+
+optimizer = optim.Adam(resnet_unet.parameters(), lr=1e-4)
 scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.5)
 
 no_debug = False

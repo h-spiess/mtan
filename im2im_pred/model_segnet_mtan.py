@@ -171,7 +171,7 @@ for epoch in range(total_epoch):
             cost[4], cost[5] = cost[4].item(), cost[5].item()
             cost[6] = train_loss[2].item()
             cost[7], cost[8], cost[9], cost[10], cost[11] = model_MTAN.normal_error(train_pred[2], train_normal)
-            avg_cost[index, :12] += cost[:12] / len(nyuv2_train_set)
+            avg_cost[index, :12] += cost[:12] / len(nyuv2_train_loader)
 
         if cleanup_gpu_memory_every_batch:
             # train_loss = [train_loss[i].detach().cpu() for i in range(len(train_loss))]
@@ -184,7 +184,7 @@ for epoch in range(total_epoch):
             gc.collect()
 
     # evaluating test data
-    with torch.no_grad():  # operations inside don't track history
+    with torch.no_grad():  # operations inside don't track historyd
         for test_data, test_label, test_depth, test_normal in tqdm(nyuv2_test_loader, desc='Testing'):
             test_data, test_label = test_data.to(device),  test_label.type(torch.LongTensor).to(device)
             test_depth, test_normal = test_depth.to(device), test_normal.to(device)
@@ -200,7 +200,7 @@ for epoch in range(total_epoch):
             cost[18] = test_loss[2].item()
             cost[19], cost[20], cost[21], cost[22], cost[23] = model_MTAN.normal_error(test_pred[2], test_normal)
 
-            avg_cost[index, 12:] += cost[12:] / len(nyuv2_test_set)
+            avg_cost[index, 12:] += cost[12:] / len(nyuv2_test_loader)
 
     time_elapsed_epoch = datetime.now() - start_time_epoch
     print('Elapsted Minutes: {}'.format(time_elapsed_epoch))

@@ -3,6 +3,7 @@ import pickle
 from pathlib import Path
 
 import torch.nn.functional as F
+from torch import nn
 
 
 class GradientLogger:
@@ -66,5 +67,30 @@ class GradientLogger:
 
         self.init_grad_metrics()
 
+
+def last_conv(module):
+    if len(list(module.children())) == 0:
+        if not isinstance(module, nn.Conv2d):
+            raise ValueError('Hook on non-sequential non-conv layer.')
+        else:
+            return module
+    for layer in reversed(list(module.children())):
+        if isinstance(layer, nn.Sequential):  # if sequential layer, apply recursively to layers in sequential layer
+            try:
+                return last_conv(layer)
+            except:  # may not contain a conv layer
+                pass
+        if isinstance(layer, nn.Conv2d):  # if leaf node, add it to list
+            return layer
+    raise ValueError('Hook on sequential with recursive inner non-conv layers.')
+
+
+def create_last_conv_hook_at(module, n_tasks, name, grad_save_path, gradient_loggers):
+    last_conv(module).register_backward_hook(
+        append_and_return(gradient_loggers, GradientLogger(n_tasks, name, grad_save_path)).update_grad_list)
+
+def append_and_return(gradient_loggers, gradient_logger):
+    gradient_loggers.append(gradient_logger)
+    return gradient_loggers[-1]
 
 # _ = _.register_hook(GradientLogger(3, 'test_layer', './grad_metrics/').add_grad_metrics)

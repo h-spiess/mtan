@@ -10,6 +10,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 import argparse
 
+from torch.utils.data import RandomSampler, SubsetRandomSampler, Subset
 from tqdm import tqdm
 
 from architectures import SegNet, ResNetUnet
@@ -35,20 +36,6 @@ opt = parser.parse_args()
 
 model = opt.model
 
-if model == 'resnet':
-    arch = ResNetUnet
-else:
-    model = 'segnet'
-    arch = SegNet
-
-# define model, optimiser and scheduler
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-cleanup_gpu_memory_every_batch = True
-model_MTAN = arch(device)
-optimizer = optim.Adam(model_MTAN.parameters(), lr=1e-4)
-scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.5)
-
-
 gettrace = getattr(sys, 'gettrace', None)
 
 no_debug = False
@@ -62,12 +49,18 @@ name_model_run = 'mtan_{}_run_{}'
 if no_debug:
     log_every_nth = 10
 
-    run_number = len(glob.glob('./logs/{}[0-9]*'.format(name_model_run.format(model, ''))))
+    old_run_dirs = glob.glob('./logs/{}[0-9]*'.format(name_model_run.format(model, '')))
+    if len(old_run_dirs) > 0:
+        run_number = int(sorted(old_run_dirs)[-1].split('_')[-1]) + 1
+    else:
+        run_number = 0
     name_model_run = name_model_run.format(model, run_number)
 
     exist_ok = False
 else:
     import shutil
+
+    model = 'resnet'
 
     log_every_nth = 1
 
@@ -80,6 +73,19 @@ else:
 os.makedirs('./logs/{}'.format(name_model_run), exist_ok=exist_ok)
 
 print(name_model_run)
+
+if model == 'resnet':
+    arch = ResNetUnet
+else:
+    model = 'segnet'
+    arch = SegNet
+
+# define model, optimiser and scheduler
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+cleanup_gpu_memory_every_batch = True
+model_MTAN = arch(device)
+optimizer = optim.Adam(model_MTAN.parameters(), lr=1e-4)
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.5)
 
 # add gradient logger hooks
 model_MTAN.gradient_logger_hooks('./logs/{}/gradient_logs/'.format(name_model_run))
@@ -100,16 +106,30 @@ nyuv2_train_set = NYUv2(root=dataset_path, train=True)
 nyuv2_test_set = NYUv2(root=dataset_path, train=False)
 
 batch_size = 2  # is the current max for segnet on 12gb gpu
+
+if not no_debug:
+    subsample = 0.1
+
+    shuffled = random.sample(list(range(len(nyuv2_train_set))), len(nyuv2_train_set))
+    nyuv2_train_set = Subset(nyuv2_train_set, shuffled[:int(len(nyuv2_train_set)*subsample)])
+
+    shuffled = random.sample(list(range(len(nyuv2_test_set))), len(nyuv2_test_set))
+    nyuv2_test_set = Subset(nyuv2_test_set, shuffled[:int(len(nyuv2_test_set) * subsample)])
+
+    num_workers = 0
+else:
+    num_workers = 2
+
 nyuv2_train_loader = torch.utils.data.DataLoader(
     dataset=nyuv2_train_set,
     batch_size=batch_size,
-    num_workers=2,
+    num_workers=num_workers,
     shuffle=True)
 
 nyuv2_test_loader = torch.utils.data.DataLoader(
     dataset=nyuv2_test_set,
     batch_size=batch_size,
-    num_workers=2,
+    num_workers=num_workers,
     shuffle=False)
 
 
@@ -184,7 +204,7 @@ for epoch in range(total_epoch):
             gc.collect()
 
     # evaluating test data
-    with torch.no_grad():  # operations inside don't track historyd
+    with torch.no_grad():  # operations inside don't track history
         for test_data, test_label, test_depth, test_normal in tqdm(nyuv2_test_loader, desc='Testing'):
             test_data, test_label = test_data.to(device),  test_label.type(torch.LongTensor).to(device)
             test_depth, test_normal = test_depth.to(device), test_normal.to(device)
@@ -212,6 +232,8 @@ for epoch in range(total_epoch):
                 avg_cost[index, 14], avg_cost[index, 15], avg_cost[index, 16], avg_cost[index, 17], avg_cost[index, 18],
                 avg_cost[index, 19], avg_cost[index, 20], avg_cost[index, 21], avg_cost[index, 22], avg_cost[index, 23]))
 
+    model_MTAN.update_gradient_loggers(index)
+
     if index % log_every_nth == 0:
         CHECKPOINT_PATH = Path('./logs/{}/model_checkpoints/'.format(name_model_run))
         os.makedirs(CHECKPOINT_PATH, exist_ok=True)
@@ -224,5 +246,5 @@ for epoch in range(total_epoch):
             'avg_cost': avg_cost
         }, CHECKPOINT_PATH/checkpoint_name)
 
-        model_MTAN.write_gradient_loggers(index)
+        model_MTAN.write_gradient_loggers()
 

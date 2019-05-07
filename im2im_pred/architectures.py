@@ -104,9 +104,13 @@ class MultiTaskModel(nn.Module):
         x_output = x_output.to('cpu')
         return np.mean(error), np.median(error), np.mean(error < 11.25), np.mean(error < 22.5), np.mean(error < 30)
 
-    def write_gradient_loggers(self, epoch):
+    def write_gradient_loggers(self):
         for gradient_logger in self.gradient_loggers:
-            gradient_logger.write_grad_metrics(epoch)
+            gradient_logger.write_grad_metrics()
+
+    def update_gradient_loggers(self, epoch):
+        for gradient_logger in self.gradient_loggers:
+            gradient_logger.update_grad_metrics(epoch)
 
     def forward(self, x):
         pass

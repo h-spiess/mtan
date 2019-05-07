@@ -21,6 +21,7 @@ class GradientLogger:
         self.grad_list_weights = []
         self.grad_list_biases = []
 
+        self.grad_metrics_save = {}
         self.init_grad_metrics()
 
     def init_grad_metrics(self):
@@ -52,20 +53,24 @@ class GradientLogger:
                         F.cosine_similarity(grad_list[task_ind], grad_list[task_ind_other], dim=0).item()
                     )
 
-    def write_grad_metrics(self, epoch):
+    def update_grad_metrics(self, epoch):
+        self.grad_metrics_save['epoch{:03d}'.format(epoch)] = self.grad_metrics
+        self.init_grad_metrics()
+
+    def write_grad_metrics(self):
         if os.path.exists(self.save_path):
             with open(self.save_path, 'rb') as handle:
                 grad_metrics = pickle.load(handle)
         else:
             grad_metrics = {}
         if self.layer_name not in grad_metrics:
-            grad_metrics[self.layer_name] = {'epoch{:03d}'.format(epoch): {}}
+            grad_metrics[self.layer_name] = {}
 
         with open(self.save_path, 'wb+') as handle:
-            grad_metrics[self.layer_name]['epoch{:03d}'.format(epoch)] = self.grad_metrics
+            grad_metrics[self.layer_name].update(self.grad_metrics_save)
             pickle.dump(grad_metrics, handle)
 
-        self.init_grad_metrics()
+        self.grad_metrics_save = {}
 
 
 def last_conv(module):

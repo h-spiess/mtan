@@ -1,24 +1,18 @@
+import argparse
 import glob
+import platform
 import random
 import sys
 from datetime import datetime
 from pathlib import Path
 
 import gc
-import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
-import argparse
-
-from torch.utils.data import RandomSampler, SubsetRandomSampler, Subset
+from torch.utils.data import RandomSampler, Subset
 from tqdm import tqdm
 
 from architectures import SegNet, ResNetUnet
 from create_dataset import *
-from torch.autograd import Variable
-
-from gradient_logger import GradientLogger
-from utils import inspect_gpu_tensors
 
 torch.backends.cudnn.benchmark = True   # may speed up training if input sizes do not vary
 
@@ -60,7 +54,7 @@ if no_debug:
 else:
     import shutil
 
-    model = 'resnet'
+    model = 'segnet'
 
     log_every_nth = 1
 
@@ -80,8 +74,18 @@ else:
     model = 'segnet'
     arch = SegNet
 
+if platform.node() == 'eltanin':
+    gpu = 3
+elif platform.node() == 'sabik':
+    gpu = 0
+else:
+    print('Specify gpu for host: ' + platform.node())
+    sys.exit(-1)
+
+
+
 # define model, optimiser and scheduler
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:{}".format(gpu) if torch.cuda.is_available() else "cpu")
 cleanup_gpu_memory_every_batch = True
 model_MTAN = arch(device)
 optimizer = optim.Adam(model_MTAN.parameters(), lr=1e-4)

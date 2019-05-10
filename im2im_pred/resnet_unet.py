@@ -11,30 +11,68 @@ class DynamicUnetWithoutSkipConnections(SequentialEx):
     def __init__(self, encoder:nn.Module, n_classes:int,
                  y_range:Optional[Tuple[float,float]]=None,
                  **kwargs):
+
+        encoder[2] = encoder[0:3]
+        encoder = nn.Sequential(*list(encoder.children())[2:])
+
+        attented_layers = []
+        filter = []
+
         imsize = (256,256)
         sfs_szs = model_sizes(encoder, size=imsize)
         sfs_idxs = list(reversed(_get_sfs_idxs(sfs_szs)))
+        sfs_idxs = sfs_idxs[:-1]
+
+        attented_layers.extend([encoder[ind] for ind in sfs_idxs[::-1]])
+        attented_layers.append(encoder[-1])
+
+        filter.extend([sfs_szs[ind][1] for ind in sfs_idxs[::-1]])
+
         x = dummy_eval(encoder, imsize).detach()
 
         ni = sfs_szs[-1][1]
-        middle_conv = nn.Sequential(conv_layer(ni, ni*2, **kwargs),
-                                    conv_layer(ni*2, ni, **kwargs)).eval()
-        x = middle_conv(x)
-        layers = [encoder, batchnorm_2d(ni), nn.ReLU(), middle_conv]
+        filter.append(ni)
 
+        middle_conv_enc = conv_layer(ni, ni*2, **kwargs).eval()
+        middle_conv_dec = conv_layer(ni*2, ni, **kwargs).eval()
+
+        x = middle_conv_enc(x)
+        x = middle_conv_dec(x)
+
+        layers = [encoder, batchnorm_2d(ni), nn.ReLU(), middle_conv_enc, middle_conv_dec]
+
+        attented_layers.append(middle_conv_enc)
+        attented_layers.append(middle_conv_dec)
+
+        filter.extend([ni*2, ni])
+
+        # sfs_idxs = sfs_idxs[:-2]
         for i,idx in enumerate(sfs_idxs):
-            not_final = i!=len(sfs_idxs)-1
+            # not_final = i!=len(sfs_idxs)-1
             up_in_c, x_in_c = int(x.shape[1]), int(sfs_szs[idx][1])
-            unet_block = UnetBlockWithoutSkipConnection(up_in_c, final_div=not_final, blur=False, self_attention=False,
+            unet_block = UnetBlockWithoutSkipConnection(up_in_c,
+                                                        # final_div=not_final,
+                                                        blur=False, self_attention=False,
                                    **kwargs).eval()
             layers.append(unet_block)
             x = unet_block(x)
 
+            attented_layers.append(layers[-1])
+            filter.append(x_in_c)   # in for first filter param for attention block
+
         ni = x.shape[1]
+
         if imsize != sfs_szs[0][-2:]: layers.append(PixelShuffle_ICNR(ni, **kwargs))
         layers += [conv_layer(ni, n_classes, ks=1, use_activ=False, **kwargs)]
+
+        attented_layers.append(layers[-1])
+        filter.extend([ni, n_classes])
+
         if y_range is not None: layers.append(SigmoidRange(*y_range))
+
         super().__init__(*layers)
+        self.attended_layers = attented_layers
+        self.filter = filter
 
     def __del__(self):
         if hasattr(self, "sfs"): self.sfs.remove()

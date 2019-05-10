@@ -156,10 +156,10 @@ class SegNet(MultiTaskModel):
         self.decoder_block_att = nn.ModuleList([self.conv_layer([filter[0], filter[0]])])
 
         for j in range(3):
-            if j < 2:
+            if j < 2:   # these are the first that don't concat
                 self.encoder_att.append(nn.ModuleList([self.att_layer([filter[0], filter[0], filter[0]])]))
                 self.decoder_att.append(nn.ModuleList([self.att_layer([2 * filter[0], filter[0], filter[0]])]))
-            for i in range(4):
+            for i in range(4):  # these are from the second that concat and therefore have double the input channels
                 self.encoder_att[j].append(self.att_layer([2 * filter[i + 1], filter[i + 1], filter[i + 1]]))
                 self.decoder_att[j].append(self.att_layer([filter[i + 1] + filter[i], filter[i], filter[i]]))
 
@@ -259,6 +259,7 @@ class SegNet(MultiTaskModel):
                 if j == 0:
                     atten_encoder[i][j][0] = self.encoder_att[i][j](g_encoder[j][0])
                     atten_encoder[i][j][1] = (atten_encoder[i][j][0]) * g_encoder[j][1]
+                    # encoder_block_att are shared
                     atten_encoder[i][j][2] = self.encoder_block_att[j](atten_encoder[i][j][1])
                     atten_encoder[i][j][2] = F.max_pool2d(atten_encoder[i][j][2], kernel_size=2, stride=2)
                 else:
@@ -386,7 +387,7 @@ class WideResNet(MultiTaskModel):
         )
         return att_block
 
-    def conv3x3(in_planes, out_planes, stride=1):
+    def conv3x3(self, in_planes, out_planes, stride=1):
         return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=True)
 
     def _wide_layer(self, block, planes, num_blocks, stride):
@@ -465,9 +466,43 @@ class ResNetUnet(MultiTaskModel):
     def __init__(self, device, pretrained=False):
         super().__init__()
         self.device = device
+        self.class_nb = 13
 
         self.resnet_unet = unet_learner_without_skip_connections(64, self.device,
                                                                  models.resnet34, pretrained=pretrained, metrics=None)
+
+        filter = self.resnet_unet.filter
+        attended_layers = self.resnet_unet.attended_layers
+
+        assert len(filter) == len(attended_layers) + 1, 'In decoder size_i & size_(i+1) needed'
+
+        # define task attention layers
+        self.encoder_att = nn.ModuleList()
+        self.decoder_att = nn.ModuleList()
+        self.encoder_block_att = nn.ModuleList([self.conv_layer([filter[0], filter[1]])])
+        self.decoder_block_att = nn.ModuleList([self.conv_layer([filter[0], filter[0]])])
+
+        # j: index of tasks
+        for j in range(3):
+            self.encoder_att.append(nn.ModuleList([self.att_layer([filter[0], filter[0], filter[0]])]))
+            self.decoder_att.append(nn.ModuleList([self.att_layer([2 * filter[0], filter[0], filter[0]])]))
+            for i in range(4):
+                self.encoder_att[j].append(self.att_layer([2 * filter[i + 1], filter[i + 1], filter[i + 1]]))
+                self.decoder_att[j].append(self.att_layer([filter[i + 1] + filter[i], filter[i], filter[i]]))
+
+        for i in range(4):
+            if i < 3:
+                self.encoder_block_att.append(self.conv_layer([filter[i + 1], filter[i + 2]]))
+                self.decoder_block_att.append(self.conv_layer([filter[i + 1], filter[i]]))
+            else:
+                self.encoder_block_att.append(self.conv_layer([filter[i + 1], filter[i + 1]]))
+                self.decoder_block_att.append(self.conv_layer([filter[i + 1], filter[i + 1]]))
+
+
+        # done
+        self.pred_task1 = self.conv_layer([filter[-1], self.class_nb], pred=True)
+        self.pred_task2 = self.conv_layer([filter[-1], 1], pred=True)
+        self.pred_task3 = self.conv_layer([filter[-1], 3], pred=True)
 
         # TODO add attention blocks
 

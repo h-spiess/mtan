@@ -14,18 +14,12 @@ from tqdm import tqdm
 from architectures import SegNet, ResNetUnet
 from create_dataset import *
 
-torch.backends.cudnn.benchmark = True   # may speed up training if input sizes do not vary
-
-seed = 43
-np.random.seed(seed)
-random.seed(seed)
-torch.manual_seed(seed)
-
 parser = argparse.ArgumentParser(description='Multi-task: Attention Network')
 parser.add_argument('--weight', default='dwa', type=str, help='multi-task weighting: equal, uncert, dwa')
 parser.add_argument('--dataroot', default='data/nyuv2', type=str, help='dataset root')
 parser.add_argument('--temp', default=2.0, type=float, help='temperature for DWA (must be positive)')
 parser.add_argument('--model', default='segnet', type=str, help="Model architecture to use: ('segnet' or 'resnet')")
+parser.add_argument('--gpu', default=-1, type=int, help='gpu to run on')
 opt = parser.parse_args()
 
 model = opt.model
@@ -54,7 +48,7 @@ if no_debug:
 else:
     import shutil
 
-    model = 'segnet'
+    model = 'resnet'
 
     log_every_nth = 1
 
@@ -68,25 +62,39 @@ os.makedirs('./logs/{}'.format(name_model_run), exist_ok=exist_ok)
 
 print(name_model_run)
 
+batch_size = 2  # is the current max for segnet on 12gb gpu
+
 if model == 'resnet':
     arch = ResNetUnet
+    # batch_size = 7  # is the maximum for resnet without skip connection
+    batch_size = 5  # is the maximum for resnet without skip connection
 else:
     model = 'segnet'
     arch = SegNet
 
-if platform.node() == 'eltanin':
-    gpu = 3
-elif platform.node() == 'sabik':
-    gpu = 0
+if opt.gpu == -1:
+    if platform.node() == 'eltanin':
+        gpu = 3
+    elif platform.node() == 'sabik':
+        gpu = 0
+    else:
+        print('Specify gpu for host: ' + platform.node())
+        sys.exit(-1)
 else:
-    print('Specify gpu for host: ' + platform.node())
-    sys.exit(-1)
-
+    gpu = opt.gpu
 
 
 # define model, optimiser and scheduler
+os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu)
 device = torch.device("cuda:{}".format(gpu) if torch.cuda.is_available() else "cpu")
 cleanup_gpu_memory_every_batch = True
+torch.backends.cudnn.benchmark = True   # may speed up training if input sizes do not vary
+
+seed = 43
+np.random.seed(seed)
+random.seed(seed)
+torch.manual_seed(seed)
+
 model_MTAN = arch(device)
 optimizer = optim.Adam(model_MTAN.parameters(), lr=1e-4)
 scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.5)
@@ -108,8 +116,6 @@ print('LOSS FORMAT: SEMANTIC_LOSS MEAN_IOU PIX_ACC | DEPTH_LOSS ABS_ERR REL_ERR 
 dataset_path = opt.dataroot
 nyuv2_train_set = NYUv2(root=dataset_path, train=True)
 nyuv2_test_set = NYUv2(root=dataset_path, train=False)
-
-batch_size = 2  # is the current max for segnet on 12gb gpu
 
 if not no_debug:
     subsample = 0.1

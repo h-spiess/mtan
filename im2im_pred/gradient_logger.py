@@ -36,7 +36,8 @@ class GradientLogger:
 
     def update_grad_list(self, module, grad_input, grad_output):
         self.grad_list_weights.append(grad_input[1].clone().detach().flatten().to('cpu'))
-        self.grad_list_biases.append(grad_input[2].clone().detach().to('cpu'))
+        if module.bias is not None:
+            self.grad_list_biases.append(grad_input[2].clone().detach().to('cpu'))
         if len(self.grad_list_weights) == self.n_tasks:
             self.add_grad_metrics()
             self.grad_list_weights = []
@@ -44,10 +45,10 @@ class GradientLogger:
 
     def add_grad_metrics(self):
         for name, grad_list in [('weights', self.grad_list_weights), ('biases', self.grad_list_biases)]:
-            for task_ind in range(self.n_tasks):
+            for task_ind in range(len(grad_list)):
                 self.grad_metrics['norm_grad_{}_task{}'.format(name, task_ind+1)].append(
                     grad_list[task_ind].norm().item())
-                for task_ind_other in range(task_ind+1, self.n_tasks):
+                for task_ind_other in range(task_ind+1, len(grad_list)):
                     self.grad_metrics['cosine_similarity_grad_{}_task{}_task{}'.format(name, task_ind + 1,
                                                                                        task_ind_other + 1)].append(
                         F.cosine_similarity(grad_list[task_ind], grad_list[task_ind_other], dim=0).item()
@@ -87,6 +88,10 @@ def last_conv(module):
                 pass
         if isinstance(layer, nn.Conv2d):  # if leaf node, add it to list
             return layer
+        try:
+            return last_conv(layer)
+        except:
+            pass
     raise ValueError('Hook on sequential with recursive inner non-conv layers.')
 
 

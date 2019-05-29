@@ -5,7 +5,7 @@ from torch import nn
 from torchvision import models
 
 from custom_layers import AttentionBlockEncoder, EncoderBlock, DecoderBlock, AttentionBlockDecoder, AttentionBlock
-from gradient_logger import create_last_conv_hook_at
+from gradient_logger import create_last_conv_hook_at, add_grad_hook, last_conv
 from resnet_unet import unet_learner_without_skip_connections
 
 
@@ -33,7 +33,7 @@ class MultiTaskModel(nn.Module):
         loss3 = 1 - torch.sum((x_pred3 * x_output3) * binary_mask) / torch.nonzero(binary_mask).size(0)
         x_output3.to('cpu')
 
-        return [loss1, loss2, loss3]
+        return torch.stack([loss1, loss2, loss3])
 
     def compute_miou(self, x_pred, x_output):
         x_output = x_output.to(self.device)
@@ -143,11 +143,142 @@ class MultiTaskModel(nn.Module):
 
     def gradient_logger_hooks(self, grad_save_path): pass
 
-class SegNet(MultiTaskModel):
+    def last_shared_layer(self):
+        pass
+
+
+class SegNetWithoutAttention(MultiTaskModel):
     def __init__(self, device):
+        super().__init__()
+
+        self.device = device
+
+        # initialise network parameters
+        self.filter = [3, 64, 128, 256, 512, 512]
+        self.class_nb = 13
+
+        self.n_tasks = 3
+
+        # add batchnorm -> in paper they are just in the task specific parts
+        # he uses it: see conv_layer
+
+        # define pooling and unpooling functions
+        self.up_sampling = nn.MaxUnpool2d(kernel_size=2, stride=2)
+
+        # define encoder decoder layers
+
+        # encoder
+
+        self.encoder = nn.ModuleList()
+
+        down_sampling = nn.MaxPool2d(kernel_size=2, stride=2, return_indices=True)
+
+        for i in range(len(self.filter) - 1):
+            self.encoder.append(
+                EncoderBlock(self.filter[i], self.filter[i+1], additional_conv_layer=True if i > 1 else False,
+                             down_sampling=None if i == 0 else down_sampling)
+            )
+        self.encoder.append(down_sampling)
+
+        # decoder
+
+        dec_filter = self.filter[::-1]
+        dec_filter[-1] = 64
+
+        self.decoder = nn.ModuleList()
+
+        for i in range(len(dec_filter) - 1):
+            self.decoder.append(
+                DecoderBlock(dec_filter[i], dec_filter[i+1], additional_conv_layer=True if i < 3 else False)
+            )
+
+        filter = self.filter[1:]
+        filter.append(filter[-1])
+
+        output_sizes = (self.class_nb, 1, 3)
+        if len(output_sizes) != self.n_tasks:
+            raise ValueError('Number of output_sizes does not match tasks.')
+
+        self.pred_task = nn.ModuleList()
+        for output_size in output_sizes:
+            self.pred_task.append(self.conv_layer([filter[0], output_size], pred=True))
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.xavier_normal_(m.weight)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                nn.init.constant_(m.bias, 0)
+
+        self.to(self.device)
+
+    def forward(self, x):
+
+        pool_indices = []
+        for i, layer in enumerate(self.encoder[:-1]):
+            x = layer(x)
+            if type(x) is tuple and len(x) == 2:
+                pool_indices.append(x[1])
+                x = x[0]
+        x, pool_ind = self.encoder[-1](x)
+        pool_indices.append(pool_ind)
+
+        pool_indices = pool_indices[::-1]
+        for i, layer in enumerate(self.decoder):
+            x = layer(x, pool_indices[i])
+        del pool_indices
+
+        # define task prediction layers
+        t1_pred = F.log_softmax(self.pred_task[0](x), dim=1)
+        t2_pred = self.pred_task[1](x)
+        t3_pred = self.pred_task[2](x)
+        t3_pred = t3_pred / torch.norm(t3_pred, p=2, dim=1, keepdim=True)
+
+        return [t1_pred, t2_pred, t3_pred], self.logsigma
+
+    def gradient_logger_hooks(self, grad_save_path):
+
+        self.grad_save_path = grad_save_path
+        self.gradient_loggers = []
+
+        def gradient_logger_hooks_encoder_decoder(enc_dec, block_name):
+
+            def name(i, ind):
+                return '{}_block_{}'.format(block_name, i)
+
+            i = 0
+            for layer in enc_dec:
+                if isinstance(layer, EncoderBlock) or isinstance(layer, DecoderBlock):
+                    add_grad_hook(layer, self.n_tasks,
+                                  name(i, None),
+                                  self.grad_save_path, self.gradient_loggers)
+                    i += 1
+
+        gradient_logger_hooks_encoder_decoder(self.encoder, 'encoder')
+        gradient_logger_hooks_encoder_decoder(self.decoder, 'decoder')
+
+    def last_shared_layer(self):
+        return last_conv(self.decoder)
+
+    def grad_norm_hook(self):
+        self.grad_norms_last_shared_layer = []
+
+        def append_grad_norm(module, grad_input, grad_output):
+            self.grad_norms_last_shared_layer.append(grad_input[1].norm())
+
+        self.last_shared_layer().register_backward_hook(append_grad_norm)
+
+
+class SegNet(MultiTaskModel):
+    def __init__(self, device, grad_hook_at_axon=True):
         super(SegNet, self).__init__()
 
         self.device = device
+        self.grad_hook_at_axon = grad_hook_at_axon
 
         # initialise network parameters
         self.filter = [3, 64, 128, 256, 512, 512]
@@ -196,33 +327,9 @@ class SegNet(MultiTaskModel):
             self.encoder[i] = AttentionBlockEncoder(self.encoder[i], filter[i], filter[i+1], self.n_tasks,
                                                     first_block=True if i == 0 else False)
 
-        # dec_filter = [dec_filter[0]] + dec_filter
-
         for i in range(len(self.decoder)):
             self.decoder[i] = AttentionBlockDecoder(self.decoder[i], dec_filter[i], dec_filter[i+1], self.n_tasks,
                                                     index_intermediate=0)
-
-
-        # self.encoder_att = nn.ModuleList([nn.ModuleList([self.att_layer([filter[0], filter[0], filter[0]])])])
-        # self.decoder_att = nn.ModuleList([nn.ModuleList([self.att_layer([2 * filter[0], filter[0], filter[0]])])])
-        # self.encoder_block_att = nn.ModuleList([self.conv_layer([filter[0], filter[1]])])
-        # self.decoder_block_att = nn.ModuleList([self.conv_layer([filter[0], filter[0]])])
-        #
-        # for j in range(3):
-        #     if j < 2:   # these are the first that don't concat
-        #         self.encoder_att.append(nn.ModuleList([self.att_layer([filter[0], filter[0], filter[0]])]))
-        #         self.decoder_att.append(nn.ModuleList([self.att_layer([2 * filter[0], filter[0], filter[0]])]))
-        #     for i in range(4):  # these are from the second that concat and therefore have double the input channels
-        #         self.encoder_att[j].append(self.att_layer([2 * filter[i + 1], filter[i + 1], filter[i + 1]]))
-        #         self.decoder_att[j].append(self.att_layer([filter[i + 1] + filter[i], filter[i], filter[i]]))
-        #
-        # for i in range(4):
-        #     if i < 3:
-        #         self.encoder_block_att.append(self.conv_layer([filter[i + 1], filter[i + 2]]))
-        #         self.decoder_block_att.append(self.conv_layer([filter[i + 1], filter[i]]))
-        #     else:
-        #         self.encoder_block_att.append(self.conv_layer([filter[i + 1], filter[i + 1]]))
-        #         self.decoder_block_att.append(self.conv_layer([filter[i + 1], filter[i + 1]]))
 
         output_sizes = (self.class_nb, 1, 3)
         if len(output_sizes) != self.n_tasks:
@@ -279,33 +386,47 @@ class SegNet(MultiTaskModel):
 
         def gradient_logger_hooks_encoder_decoder(enc_dec, block_name):
 
-            def name(i, conv_ind):
-                return '{}_block_{}_conv_{}'.format(block_name, i, conv_ind)
+            def name(i, ind):
+                if self.grad_hook_at_axon:
+                    return '{}_block_{}'.format(block_name, i)
+                else:
+                    return '{}_block_{}_conv_{}'.format(block_name, i, ind)
 
             i = 0
             for layer in enc_dec:
                 if hasattr(layer, 'attented_layer'):
-                    for conv_ind in (0, len(layer.attented_layer.layers) -1):
-                        if type(layer.attented_layer.layers[conv_ind]) is nn.MaxPool2d or \
-                                type(layer.attented_layer.layers[conv_ind]) is nn.MaxUnpool2d:
-                            conv_ind_ = conv_ind + 1
-                        else:
-                            conv_ind_ = conv_ind
-                        create_last_conv_hook_at(layer.attented_layer.layers[conv_ind_], self.n_tasks,
-                                                 name(i, conv_ind),
-                                                 self.grad_save_path, self.gradient_loggers)
+                    if self.grad_hook_at_axon:
+                        add_grad_hook(layer.attented_layer, self.n_tasks,
+                                                     name(i, None),
+                                                     self.grad_save_path, self.gradient_loggers)
+                    else:
+                        for conv_ind in (0, len(layer.attented_layer.layers) -1):
+                            if type(layer.attented_layer.layers[conv_ind]) is nn.MaxPool2d or \
+                                    type(layer.attented_layer.layers[conv_ind]) is nn.MaxUnpool2d:
+                                conv_ind_ = conv_ind + 1
+                            else:
+                                conv_ind_ = conv_ind
+                            create_last_conv_hook_at(layer.attented_layer.layers[conv_ind_], self.n_tasks,
+                                                     name(i, conv_ind),
+                                                     self.grad_save_path, self.gradient_loggers)
                     i += 1
 
         gradient_logger_hooks_encoder_decoder(self.encoder, 'encoder')
         gradient_logger_hooks_encoder_decoder(self.decoder, 'decoder')
 
+    def last_shared_layer(self):
+        return last_conv(self.decoder)
 
+# Doesn't work that well, probably too few parameters
 class ResNetUnet(MultiTaskModel):
-    def __init__(self, device, pretrained=False, skip_connections=True):
+    def __init__(self, device, pretrained=False, skip_connections=True, grad_hook_at_axon=True):
         super().__init__()
         self.device = device
         self.class_nb = 13
         self.n_tasks = 3
+
+        self.grad_hook_at_axon = grad_hook_at_axon
+
 
         self.resnet_unet = unet_learner_without_skip_connections(64, self.device,
                                                                  models.resnet34, pretrained=pretrained, metrics=None,

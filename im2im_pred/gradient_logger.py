@@ -35,8 +35,12 @@ class GradientLogger:
                         'cosine_similarity_grad_{}_task{}_task{}'.format(name, task_ind + 1, task_ind_other + 1)] = []
 
     def update_grad_list(self, module, grad_input, grad_output):
-        self.grad_list_weights.append(grad_input[1].clone().detach().flatten().to('cpu'))
-        if module.bias is not None:
+        if len(grad_input) == 1:
+            ind = 0
+        else:
+            ind = 1
+        self.grad_list_weights.append(grad_input[ind].clone().detach().flatten().to('cpu'))
+        if hasattr(module, 'bias') and module.bias is not None:
             self.grad_list_biases.append(grad_input[2].clone().detach().to('cpu'))
         if len(self.grad_list_weights) == self.n_tasks:
             self.add_grad_metrics()
@@ -96,8 +100,13 @@ def last_conv(module):
 
 
 def create_last_conv_hook_at(module, n_tasks, name, grad_save_path, gradient_loggers):
-    last_conv(module).register_backward_hook(
+    add_grad_hook(last_conv(module), n_tasks, name, grad_save_path, gradient_loggers)
+
+
+def add_grad_hook(module, n_tasks, name, grad_save_path, gradient_loggers):
+    module.register_backward_hook(
         append_and_return(gradient_loggers, GradientLogger(n_tasks, name, grad_save_path)).update_grad_list)
+
 
 def append_and_return(gradient_loggers, gradient_logger):
     gradient_loggers.append(gradient_logger)

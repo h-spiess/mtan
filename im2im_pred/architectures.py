@@ -83,14 +83,18 @@ class MultiTaskModel(nn.Module):
         x_output = x_output.to('cpu')
         return pixel_acc / batch_size
 
-    def depth_error(self, x_pred, x_output):
+    def depth_error(self, x_pred, x_output, rmse=True):
         x_output = x_output.to(self.device)
 
         binary_mask = (torch.sum(x_output, dim=1) != 0).unsqueeze(1).to(self.device)
         x_pred_true = x_pred.masked_select(binary_mask)
         x_output_true = x_output.masked_select(binary_mask)
-        abs_err = torch.abs(x_pred_true - x_output_true)
-        rel_err = torch.abs(x_pred_true - x_output_true) / x_output_true
+
+        if not rmse:
+            abs_err = torch.abs(x_pred_true - x_output_true)
+        else:
+            abs_err = torch.sqrt((x_pred_true - x_output_true)**2)
+        rel_err = abs_err / x_output_true
 
         x_output = x_output.to('cpu')
         return torch.sum(abs_err) / torch.nonzero(binary_mask).size(0), torch.sum(rel_err) / torch.nonzero(binary_mask).size(0)

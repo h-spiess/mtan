@@ -13,6 +13,7 @@ from tqdm import tqdm
 
 from architectures import SegNet, ResNetUnet, SegNetWithoutAttention
 from create_dataset import *
+from model_testing import evaluate_model, write_performance
 
 parser = argparse.ArgumentParser(description='Multi-task: Attention Network')
 parser.add_argument('--weight', default='dwa', type=str, help='multi-task weighting: equal, uncert, dwa, gradnorm')
@@ -46,14 +47,14 @@ if no_debug:
         run_number = int(sorted(old_run_dirs)[-1].split('_')[-1]) + 1
     else:
         run_number = 0
-    name_model_run = name_model_run.format(model_name, run_number)
+    name_model_run = name_model_run.format(model_name, opt.weight, run_number)
 
     exist_ok = False
 else:
     import shutil
 
-    model_name = 'segnet_without_attention'
-    opt.weight = 'gradnorm'
+    model_name = 'segnet'
+    # opt.weight = 'gradnorm'
 
     log_every_nth = 1
 
@@ -125,7 +126,8 @@ def count_parameters(model):
 
 print('Parameter Space: ABS: {:.1f}, REL: {:.4f}\n'.format(count_parameters(model),
                                                            count_parameters(model) / 24981069))
-print('LOSS FORMAT: SEMANTIC_LOSS MEAN_IOU PIX_ACC | DEPTH_LOSS ABS_ERR REL_ERR | NORMAL_LOSS MEAN MED <11.25 <22.5 <30\n')
+loss_str = 'LOSS FORMAT: SEMANTIC_LOSS | MEAN_IOU PIX_ACC | DEPTH_LOSS | ABS_ERR REL_ERR | NORMAL_LOSS | MEAN MED <11.25 <22.5 <30\n'
+print(loss_str)
 
 # define dataset path
 dataset_path = opt.dataroot
@@ -255,38 +257,20 @@ for epoch in range(total_epoch):
             torch.cuda.empty_cache()
             gc.collect()
 
-    # evaluating test data
-    with torch.no_grad():  # operations inside don't track history
-        for test_data, test_label, test_depth, test_normal in tqdm(nyuv2_test_loader, desc='Testing'):
-            test_data, test_label = test_data.to(device),  test_label.type(torch.LongTensor).to(device)
-            test_depth, test_normal = test_depth.to(device), test_normal.to(device)
-
-            test_pred, _ = model(test_data)
-            test_loss = model.model_fit(test_pred[0], test_label, test_pred[1], test_depth, test_pred[2], test_normal)
-
-            cost[12] = test_loss[0].item()
-            cost[13] = model.compute_miou(test_pred[0], test_label).item()
-            cost[14] = model.compute_iou(test_pred[0], test_label).item()
-            cost[15] = test_loss[1].item()
-            cost[16], cost[17] = model.depth_error(test_pred[1], test_depth)
-            cost[18] = test_loss[2].item()
-            cost[19], cost[20], cost[21], cost[22], cost[23] = model.normal_error(test_pred[2], test_normal)
-
-            avg_cost[index, 12:] += cost[12:] / len(nyuv2_test_loader)
+    avg_cost[index, 12:], test_performance = evaluate_model(model, nyuv2_test_loader, device, index)
 
     time_elapsed_epoch = datetime.now() - start_time_epoch
     print('Elapsted Minutes: {}'.format(time_elapsed_epoch))
-    print(
-        '''Epoch: {:04d} | TRAIN: {:.4f} {:.4f} {:.4f} | {:.4f} {:.4f} {:.4f} | {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f}
-               TEST: {:.4f} {:.4f} {:.4f} | {:.4f} {:.4f} {:.4f} | {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f}'''
-            .format(index, avg_cost[index, 0], avg_cost[index, 1], avg_cost[index, 2], avg_cost[index, 3],
-                    avg_cost[index, 4], avg_cost[index, 5], avg_cost[index, 6], avg_cost[index, 7], avg_cost[index, 8],
-                    avg_cost[index, 9],
-                    avg_cost[index, 10], avg_cost[index, 11], avg_cost[index, 12], avg_cost[index, 13],
-                    avg_cost[index, 14], avg_cost[index, 15], avg_cost[index, 16], avg_cost[index, 17],
-                    avg_cost[index, 18],
-                    avg_cost[index, 19], avg_cost[index, 20], avg_cost[index, 21], avg_cost[index, 22],
-                    avg_cost[index, 23]))
+
+    performance = '''Epoch: {:04d} | TRAIN: {:.4f} | {:.4f} {:.4f} | {:.4f} | {:.4f} {:.4f} | {:.4f} | {:.4f} {:.4f} {:.4f} {:.4f} {:.4f}
+    {}'''.format(
+            index, avg_cost[index, 0], avg_cost[index, 1], avg_cost[index, 2], avg_cost[index, 3],
+            avg_cost[index, 4], avg_cost[index, 5], avg_cost[index, 6], avg_cost[index, 7], avg_cost[index, 8],
+            avg_cost[index, 9],
+            avg_cost[index, 10], avg_cost[index, 11],
+            test_performance)
+
+    print(performance)
 
     model.update_gradient_loggers(index)
 
@@ -304,3 +288,4 @@ for epoch in range(total_epoch):
 
         model.write_gradient_loggers()
 
+write_performance(name_model_run, performance, loss_str)

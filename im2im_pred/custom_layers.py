@@ -91,11 +91,14 @@ class DecoderBlock(nn.Module):
 
 class AttentionBlock(nn.Module):
 
-    def __init__(self, attented_layer, shared_feature_extractor, n_tasks):
+    def __init__(self, attented_layer, shared_feature_extractor, n_tasks, save_attention_mask=True):
         super().__init__()
         self.attented_layer = attented_layer
         self.shared_feature_extractor = shared_feature_extractor
         self.n_tasks = n_tasks
+        self.save_attention_mask = save_attention_mask
+        self.attention_mask = None
+
 
     def forward(self, input_trunk, input_task_specific=None):
         raise ValueError('Not sensible for Superclass.')
@@ -173,7 +176,9 @@ class AttentionBlockEncoder(AttentionBlock):
             input_attention = torch.cat((output_trunk_intermediate,
                                          input_task_specific[i].type_as(output_trunk_intermediate)), dim=1)
             output_attention = self.specific_feature_extractor[i](input_attention)
-            output_attention = (output_attention) * output_trunk_
+            if self.save_attention_mask:
+                self.attention_mask = output_attention.data.cpu().numpy()
+            output_attention = output_attention * output_trunk_
             # encoder_block_att are shared
             output_attention = self.shared_feature_extractor(output_attention)
             if self.downsampling:
@@ -242,6 +247,8 @@ class AttentionBlockDecoder(AttentionBlock):
             input_attention = torch.cat((output_trunk_, output_attention.type_as(output_trunk_)), dim=1)
 
             output_attention = self.specific_feature_extractor[i](input_attention)
+            if self.save_attention_mask:
+                self.attention_mask = output_attention.data.cpu().numpy()
             output_attention = output_attention * output_trunk
             output_attentions.append(output_attention)
 

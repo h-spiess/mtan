@@ -274,7 +274,7 @@ for epoch in range(total_epoch):
 
     model.update_gradient_loggers(index)
 
-    if index % log_every_nth == 0:
+    if index % log_every_nth == 0 or index == total_epoch-1:
         CHECKPOINT_PATH = Path('./logs/{}/model_checkpoints/'.format(name_model_run))
         os.makedirs(CHECKPOINT_PATH, exist_ok=True)
 

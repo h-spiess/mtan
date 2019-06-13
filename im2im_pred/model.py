@@ -1,29 +1,16 @@
-import argparse
-import glob
-import platform
-import random
 import sys
-from datetime import datetime
-from pathlib import Path
-
-import gc
-import torch.optim as optim
-from torch.utils.data import RandomSampler, Subset
-from tqdm import tqdm
-
-from architectures import SegNet, ResNetUnet, SegNetWithoutAttention
-from create_dataset import *
-from model_testing import evaluate_model, write_performance
+import platform
+import argparse
+import os
 
 parser = argparse.ArgumentParser(description='Multi-task: Attention Network')
 parser.add_argument('--weight', default='dwa', type=str, help='multi-task weighting: equal, uncert, dwa, gradnorm')
 parser.add_argument('--dataroot', default='data/nyuv2', type=str, help='dataset root')
 parser.add_argument('--temp', default=2.0, type=float, help='temperature for DWA (must be positive)')
-parser.add_argument('--model', default='segnet', type=str, help="Model architecture to use: ('segnet' or 'resnet')")
+parser.add_argument('--model', default='segnet', type=str, help="Model architecture to use: ('segnet', 'segnet_without_attention' or 'resnet')")
 parser.add_argument('--gpu', default=-1, type=int, help='gpu to run on')
+parser.add_argument('--shrink', default=1, type=int, help='shrinkage_factor on image sizes')
 opt = parser.parse_args()
-
-model_name = opt.model
 
 gettrace = getattr(sys, 'gettrace', None)
 
@@ -33,51 +20,6 @@ if gettrace is not None:
         no_debug = True
 else:
     no_debug = True
-
-if model_name not in ('resnet', 'segnet_without_attention', 'segnet'):
-    print("Specified unknown model_name: {}. Changed to 'segnet''".format(model_name))
-    model_name = 'segnet'
-
-name_model_run = 'mtan_{}_{}_run_{}'
-if no_debug:
-    log_every_nth = 10
-
-    old_run_dirs = glob.glob('./logs/{}[0-9]*'.format(name_model_run.format(model_name, opt.weight, '')))
-    if len(old_run_dirs) > 0:
-        run_number = int(sorted(old_run_dirs)[-1].split('_')[-1]) + 1
-    else:
-        run_number = 0
-    name_model_run = name_model_run.format(model_name, opt.weight, run_number)
-
-    exist_ok = False
-else:
-    import shutil
-
-    model_name = 'segnet'
-    # opt.weight = 'gradnorm'
-
-    log_every_nth = 1
-
-    name_model_run = name_model_run.format(model_name, opt.weight, 'debug')
-    if os.path.exists('./logs/{}'.format(name_model_run)):
-        shutil.rmtree('./logs/{}'.format(name_model_run))
-
-    exist_ok = True
-
-os.makedirs('./logs/{}'.format(name_model_run), exist_ok=exist_ok)
-
-print(name_model_run)
-
-batch_size = 2  # is the current max for segnet on 12gb gpu
-
-if model_name == 'resnet':
-    arch = ResNetUnet
-    # batch_size = 7  # is the maximum for resnet without skip connection
-    batch_size = 5  # is the maximum for resnet without skip connection
-elif model_name == 'segnet_without_attention':
-    arch = SegNetWithoutAttention
-else:
-    arch = SegNet
 
 if opt.gpu == -1:
     if platform.node() == 'eltanin':
@@ -91,12 +33,87 @@ else:
     gpu = opt.gpu
 
 if not no_debug:
-    gpu = 2
-
+    gpu = 0
 
 # define model, optimiser and scheduler
 os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu)
-device = torch.device("cuda:{}".format(gpu) if torch.cuda.is_available() else "cpu")
+
+
+import glob
+
+import random
+from datetime import datetime
+from pathlib import Path
+
+import gc
+
+from tqdm import tqdm
+
+import torch.optim as optim
+from torch.utils.data import RandomSampler, Subset
+
+from architectures import SegNet, ResNetUnet, SegNetWithoutAttention
+from create_dataset import *
+from model_testing import evaluate_model, write_performance
+
+model_name = opt.model
+
+if model_name not in ('resnet', 'segnet_without_attention', 'segnet'):
+    print("Specified unknown model_name: {}. Changed to 'segnet''".format(model_name))
+    model_name = 'segnet'
+
+
+def shrink_str(shrink):
+    if shrink != 1:
+        return 'shrink_' + str(shrink) + '_'
+    else:
+        return ''
+
+
+name_model_run = 'mtan_{}_{}_{}run_{}'
+if no_debug:
+    log_every_nth = 10
+
+    old_run_dirs = glob.glob('./logs/{}[0-9]*'.format(name_model_run.
+                                                      format(model_name, opt.weight, shrink_str(opt.shrink), '')))
+    if len(old_run_dirs) > 0:
+        run_number = int(sorted(old_run_dirs)[-1].split('_')[-1]) + 1
+    else:
+        run_number = 0
+    name_model_run = name_model_run.format(model_name, opt.weight, shrink_str(opt.shrink), run_number)
+
+    exist_ok = False
+else:
+    import shutil
+
+    model_name = 'segnet'
+    # opt.weight = 'gradnorm'
+    opt.shrink = 4
+
+    log_every_nth = 1
+
+    name_model_run = name_model_run.format(model_name, opt.weight, shrink_str(opt.shrink), 'debug')
+    if os.path.exists('./logs/{}'.format(name_model_run)):
+        shutil.rmtree('./logs/{}'.format(name_model_run))
+
+    exist_ok = True
+
+os.makedirs('./logs/{}'.format(name_model_run), exist_ok=exist_ok)
+
+print(name_model_run)
+
+batch_size = 2 * (opt.shrink**2)  # is the current max for segnet on 12gb gpu
+
+if model_name == 'resnet':
+    arch = ResNetUnet
+    # batch_size = 7  # is the maximum for resnet without skip connection
+    batch_size = 5  # is the maximum for resnet without skip connection
+elif model_name == 'segnet_without_attention':
+    arch = SegNetWithoutAttention
+else:
+    arch = SegNet
+
+device = torch.device("cuda:{}".format(0) if torch.cuda.is_available() else "cpu")
 cleanup_gpu_memory_every_batch = True
 torch.backends.cudnn.benchmark = True   # may speed up training if input sizes do not vary
 
@@ -112,8 +129,8 @@ if opt.weight == 'gradnorm':
     model.grad_norm_hook()
     initial_task_loss = None
 
-optimizer = optim.Adam(model.parameters(), lr=1e-4)
-scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.5)
+optimizer = optim.Adam(model.parameters(), lr=1e-4*opt.shrink)
+# scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.5)
 
 # add gradient logger hooks
 model.gradient_logger_hooks('./logs/{}/gradient_logs/'.format(name_model_run))
@@ -131,8 +148,8 @@ print(loss_str)
 
 # define dataset path
 dataset_path = opt.dataroot
-nyuv2_train_set = NYUv2(root=dataset_path, train=True)
-nyuv2_test_set = NYUv2(root=dataset_path, train=False)
+nyuv2_train_set = NYUv2(root=dataset_path, train=True, shrinkage_factor=opt.shrink)
+nyuv2_test_set = NYUv2(root=dataset_path, train=False, shrinkage_factor=opt.shrink)
 
 if not no_debug:
     subsample = 0.1
@@ -164,6 +181,8 @@ nyuv2_test_loader = torch.utils.data.DataLoader(
 total_epoch = 100   # he trained for 200
 T = opt.temp
 avg_cost = np.zeros([total_epoch, 24], dtype=np.float32)
+test_avg_cost = np.zeros(12, dtype=np.float32)
+test_cost = np.zeros(12, dtype=np.float32)
 lambda_weight = np.ones([3, total_epoch])
 
 for epoch in range(total_epoch):
@@ -171,7 +190,7 @@ for epoch in range(total_epoch):
 
     index = epoch
     cost = np.zeros(24, dtype=np.float32)
-    scheduler.step()
+    # scheduler.step()
 
     # apply Dynamic Weight Average
     if opt.weight == 'dwa':
@@ -257,7 +276,8 @@ for epoch in range(total_epoch):
             torch.cuda.empty_cache()
             gc.collect()
 
-    avg_cost[index, 12:], test_performance = evaluate_model(model, nyuv2_test_loader, device, index)
+    avg_cost[index, 12:], test_performance = evaluate_model(model, nyuv2_test_loader, device, index,
+                                                            test_avg_cost, test_cost)
 
     time_elapsed_epoch = datetime.now() - start_time_epoch
     print('Elapsted Minutes: {}'.format(time_elapsed_epoch))

@@ -1,6 +1,6 @@
+import torch.nn.functional as F
 from fastai.imports import torch
 from torch import nn
-import torch.nn.functional as F
 
 
 def conv_layer(channel, pred=False):
@@ -16,6 +16,7 @@ def conv_layer(channel, pred=False):
             nn.Conv2d(in_channels=channel[0], out_channels=channel[1], kernel_size=1, padding=0),
         )
     return conv_block
+
 
 def att_layer(channel):
     att_block = nn.Sequential(
@@ -41,22 +42,27 @@ class EncoderBlock(nn.Module):
         if additional_conv_layer:
             seq_modules.append(conv_layer([filter_next, filter_next]))
         self.layers = nn.Sequential(*seq_modules)
+        self.pool_output_size = None
 
     def forward(self, input, index_intermediate=None):
         if index_intermediate is None:
             if hasattr(self.layers[0], 'return_indices') and self.layers[0].return_indices:
-                    input, pool_indices = self.layers[0](input)
-                    return (self.layers[1:](input), pool_indices)
+                if self.pool_output_size is None:
+                    self.pool_output_size = input.size()
+                input, pool_indices = self.layers[0](input)
+                return self.layers[1:](input), pool_indices
 
             return self.layers(input)
         else:
             if hasattr(self.layers[0], 'return_indices') and self.layers[0].return_indices:
-                    input, pool_indices = self.layers[0](input)
-                    output_intermediate = self.layers[1:index_intermediate + 1](input)
-                    return (self.layers[index_intermediate + 1:](output_intermediate), pool_indices), output_intermediate
+                if self.pool_output_size is None:
+                    self.pool_output_size = input.size()
+                input, pool_indices = self.layers[0](input)
+                output_intermediate = self.layers[1:index_intermediate + 1](input)
+                return (self.layers[index_intermediate + 1:](output_intermediate), pool_indices), output_intermediate
 
-            output_intermediate = self.layers[:index_intermediate+1](input)
-            return self.layers[index_intermediate+1:](output_intermediate), output_intermediate
+            output_intermediate = self.layers[:index_intermediate + 1](input)
+            return self.layers[index_intermediate + 1:](output_intermediate), output_intermediate
 
 
 class DecoderBlock(nn.Module):
@@ -72,11 +78,11 @@ class DecoderBlock(nn.Module):
             seq_modules.append(conv_layer([filter_next, filter_next]))
         self.layers = nn.Sequential(*seq_modules)
 
-    def forward(self, input, pool_indices, index_intermediate=None):
+    def forward(self, input, pool_indices, index_intermediate=None, output_size=None):
         assert type(self.layers[0]) is nn.MaxUnpool2d, \
             'First module in every decoder block has to be unpooling, otherwise change forward method.'
 
-        output = self.layers[0](input, pool_indices)
+        output = self.layers[0](input, pool_indices, output_size=output_size)
         if index_intermediate is None:
             output = self.layers[1:](output)
             return output
@@ -84,8 +90,8 @@ class DecoderBlock(nn.Module):
             if index_intermediate == 0:
                 output_intermediate = output
             else:
-                output_intermediate = self.layers[1:index_intermediate+1](output)
-            output = self.layers[index_intermediate+1:](output_intermediate)
+                output_intermediate = self.layers[1:index_intermediate + 1](output)
+            output = self.layers[index_intermediate + 1:](output_intermediate)
             return output, output_intermediate
 
 
@@ -98,7 +104,6 @@ class AttentionBlock(nn.Module):
         self.n_tasks = n_tasks
         self.save_attention_mask = save_attention_mask
         self.attention_mask = None
-
 
     def forward(self, input_trunk, input_task_specific=None):
         raise ValueError('Not sensible for Superclass.')
@@ -140,7 +145,7 @@ class AttentionBlockEncoder(AttentionBlock):
 
         if not self.first_block:
             # TODO this is not okay for resnet
-            filter = [2*filter, filter, filter]
+            filter = [2 * filter, filter, filter]
         else:
             filter = [filter, filter, filter]
 
@@ -187,9 +192,14 @@ class AttentionBlockEncoder(AttentionBlock):
 
         return output_trunk, tuple(output_attentions)
 
+    @property
+    def pool_output_size(self):
+        return self.attented_layer.pool_output_size
+
 
 class AttentionBlockDecoder(AttentionBlock):
-    def __init__(self, attented_layer, filter, filter_next, n_tasks, index_intermediate=None, resnet=False, upsampling=True,
+    def __init__(self, attented_layer, filter, filter_next, n_tasks, index_intermediate=None, resnet=False,
+                 upsampling=True,
                  last_block_resnet=False, before_last_block_resnet=False):
         shared_feature_extractor = self.conv_layer([filter, filter_next])
 
@@ -207,30 +217,33 @@ class AttentionBlockDecoder(AttentionBlock):
             self.last_block_resnet = True
             filter = 32
 
-        filter = [filter + filter_next if (self.index_intermediate is not None and not self.resnet) or self.last_block_resnet
-                  else 2 * filter_next,
-                  filter_next, filter_next]
+        filter = [
+            filter + filter_next if (self.index_intermediate is not None and not self.resnet) or self.last_block_resnet
+            else 2 * filter_next,
+            filter_next, filter_next]
         self.specific_feature_extractor = nn.ModuleList([self.att_layer(filter) for _ in range(self.n_tasks)])
 
-    def forward(self, input_trunk, input_task_specific):
+    def forward(self, input_trunk, input_task_specific, output_size=None):
 
         if len(input_task_specific) != self.n_tasks:
             raise ValueError('Input from task-specific route not same count as tasks.')
 
         if self.index_intermediate is None:
             if type(input_trunk) is tuple:
-                output_trunk = self.attented_layer(*input_trunk)
+                output_trunk = self.attented_layer(*input_trunk, output_size=output_size)
             else:
-                output_trunk = self.attented_layer(input_trunk)
+                output_trunk = self.attented_layer(input_trunk, output_size=output_size)
 
             output_trunk_ = output_trunk
         else:
             if type(input_trunk) is tuple:
                 output_trunk, output_trunk_intermediate = self.attented_layer(*input_trunk,
-                                                                              index_intermediate=self.index_intermediate)
+                                                                              index_intermediate=self.index_intermediate,
+                                                                              output_size=output_size)
             else:
                 output_trunk, output_trunk_intermediate = self.attented_layer(input_trunk,
-                                                                              index_intermediate=self.index_intermediate)
+                                                                              index_intermediate=self.index_intermediate,
+                                                                              output_size=output_size)
 
             output_trunk_ = output_trunk_intermediate
 
@@ -238,8 +251,10 @@ class AttentionBlockDecoder(AttentionBlock):
 
         for i in range(self.n_tasks):
             if self.upsampling:
-                output_attention = F.interpolate(input_task_specific[i], scale_factor=2, mode='bilinear',
-                                                       align_corners=True)
+                output_attention = F.interpolate(input_task_specific[i],
+                                                 scale_factor=2 if output_size is None else None,
+                                                 mode='bilinear',
+                                                 align_corners=True, size=output_size[2:])
             else:
                 output_attention = input_task_specific[i]
             output_attention = self.shared_feature_extractor(output_attention)
@@ -253,4 +268,3 @@ class AttentionBlockDecoder(AttentionBlock):
             output_attentions.append(output_attention)
 
         return output_trunk, tuple(output_attentions)
-

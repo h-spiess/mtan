@@ -45,8 +45,10 @@ class MultiTaskModel(nn.Module):
             true_class = 0
             first_switch = True
             for j in range(self.class_nb):
-                pred_mask = torch.eq(x_pred_label[i], torch.full(x_pred_label[i].shape, j, dtype=torch.long, device=self.device))
-                true_mask = torch.eq(x_output_label[i], torch.full(x_output_label[i].shape, j, dtype=torch.long, device=self.device))
+                pred_mask = torch.eq(x_pred_label[i],
+                                     torch.full(x_pred_label[i].shape, j, dtype=torch.long, device=self.device))
+                true_mask = torch.eq(x_output_label[i],
+                                     torch.full(x_output_label[i].shape, j, dtype=torch.long, device=self.device))
                 mask_comb = pred_mask + true_mask
                 union = torch.sum((mask_comb > 0).type(torch.FloatTensor))
                 intsec = torch.sum((mask_comb > 1).type(torch.FloatTensor))
@@ -77,7 +79,8 @@ class MultiTaskModel(nn.Module):
                 pixel_acc = torch.div(torch.sum(torch.eq(x_pred_label[i], x_output_label[i]).type(torch.FloatTensor)),
                                       torch.sum((x_output_label[i] >= 0).type(torch.FloatTensor)))
             else:
-                pixel_acc = pixel_acc + torch.div(torch.sum(torch.eq(x_pred_label[i], x_output_label[i]).type(torch.FloatTensor)),
+                pixel_acc = pixel_acc + torch.div(
+                    torch.sum(torch.eq(x_pred_label[i], x_output_label[i]).type(torch.FloatTensor)),
                     torch.sum((x_output_label[i] >= 0).type(torch.FloatTensor)))
 
         x_output = x_output.to('cpu')
@@ -93,17 +96,19 @@ class MultiTaskModel(nn.Module):
         if not rmse:
             abs_err = torch.abs(x_pred_true - x_output_true)
         else:
-            abs_err = torch.sqrt((x_pred_true - x_output_true)**2)
+            abs_err = torch.sqrt((x_pred_true - x_output_true) ** 2)
         rel_err = abs_err / x_output_true
 
         x_output = x_output.to('cpu')
-        return torch.sum(abs_err) / torch.nonzero(binary_mask).size(0), torch.sum(rel_err) / torch.nonzero(binary_mask).size(0)
+        return torch.sum(abs_err) / torch.nonzero(binary_mask).size(0), torch.sum(rel_err) / torch.nonzero(
+            binary_mask).size(0)
 
     def normal_error(self, x_pred, x_output):
         x_output = x_output.to(self.device)
 
         binary_mask = (torch.sum(x_output, dim=1) != 0)
-        error = torch.acos(torch.clamp(torch.sum(x_pred * x_output, 1).masked_select(binary_mask), -1, 1)).detach().cpu().numpy()
+        error = torch.acos(
+            torch.clamp(torch.sum(x_pred * x_output, 1).masked_select(binary_mask), -1, 1)).detach().cpu().numpy()
         error = np.degrees(error)
 
         x_output = x_output.to('cpu')
@@ -145,17 +150,20 @@ class MultiTaskModel(nn.Module):
         )
         return att_block
 
-    def gradient_logger_hooks(self, grad_save_path): pass
+    def gradient_logger_hooks(self, grad_save_path):
+        pass
 
     def last_shared_layer(self):
         pass
 
 
 class SegNetWithoutAttention(MultiTaskModel):
-    def __init__(self, device):
+    def __init__(self, device, grad_hook_at_axon=False):
         super().__init__()
 
         self.device = device
+
+        self.grad_hook_at_axon = grad_hook_at_axon
 
         # initialise network parameters
         self.filter = [3, 64, 128, 256, 512, 512]
@@ -179,7 +187,7 @@ class SegNetWithoutAttention(MultiTaskModel):
 
         for i in range(len(self.filter) - 1):
             self.encoder.append(
-                EncoderBlock(self.filter[i], self.filter[i+1], additional_conv_layer=True if i > 1 else False,
+                EncoderBlock(self.filter[i], self.filter[i + 1], additional_conv_layer=True if i > 1 else False,
                              down_sampling=None if i == 0 else down_sampling)
             )
         self.encoder.append(down_sampling)
@@ -193,7 +201,7 @@ class SegNetWithoutAttention(MultiTaskModel):
 
         for i in range(len(dec_filter) - 1):
             self.decoder.append(
-                DecoderBlock(dec_filter[i], dec_filter[i+1], additional_conv_layer=True if i < 3 else False)
+                DecoderBlock(dec_filter[i], dec_filter[i + 1], additional_conv_layer=True if i < 3 else False)
             )
 
         filter = self.filter[1:]
@@ -223,18 +231,23 @@ class SegNetWithoutAttention(MultiTaskModel):
     def forward(self, x):
 
         pool_indices = []
+        output_sizes = []
         for i, layer in enumerate(self.encoder[:-1]):
             x = layer(x)
+            output_sizes.append(layer.pool_output_size)
             if type(x) is tuple and len(x) == 2:
                 pool_indices.append(x[1])
                 x = x[0]
+        output_sizes.append(x.size())
         x, pool_ind = self.encoder[-1](x)
         pool_indices.append(pool_ind)
 
         pool_indices = pool_indices[::-1]
+        output_sizes = output_sizes[::-1]
         for i, layer in enumerate(self.decoder):
-            x = layer(x, pool_indices[i])
+            x = layer(x, pool_indices[i], output_size=output_sizes[i])
         del pool_indices
+        del output_sizes
 
         # define task prediction layers
         t1_pred = F.log_softmax(self.pred_task[0](x), dim=1)
@@ -257,9 +270,13 @@ class SegNetWithoutAttention(MultiTaskModel):
             i = 0
             for layer in enc_dec:
                 if isinstance(layer, EncoderBlock) or isinstance(layer, DecoderBlock):
-                    add_grad_hook(layer, self.n_tasks,
-                                  name(i, None),
-                                  self.grad_save_path, self.gradient_loggers)
+                    if self.grad_hook_at_axon:
+                        add_grad_hook(layer, self.n_tasks,
+                                      name(i, None),
+                                      self.grad_save_path, self.gradient_loggers)
+                    else:
+                        create_last_conv_hook_at(layer, self.n_tasks, name(i, None), self.grad_save_path,
+                                                 self.gradient_loggers)
                     i += 1
 
         gradient_logger_hooks_encoder_decoder(self.encoder, 'encoder')
@@ -278,7 +295,7 @@ class SegNetWithoutAttention(MultiTaskModel):
 
 
 class SegNet(MultiTaskModel):
-    def __init__(self, device, grad_hook_at_axon=True):
+    def __init__(self, device, grad_hook_at_axon=False):
         super(SegNet, self).__init__()
 
         self.device = device
@@ -306,7 +323,7 @@ class SegNet(MultiTaskModel):
 
         for i in range(len(self.filter) - 1):
             self.encoder.append(
-                EncoderBlock(self.filter[i], self.filter[i+1], additional_conv_layer=True if i > 1 else False,
+                EncoderBlock(self.filter[i], self.filter[i + 1], additional_conv_layer=True if i > 1 else False,
                              down_sampling=None if i == 0 else down_sampling)
             )
         self.encoder.append(down_sampling)
@@ -320,7 +337,7 @@ class SegNet(MultiTaskModel):
 
         for i in range(len(dec_filter) - 1):
             self.decoder.append(
-                DecoderBlock(dec_filter[i], dec_filter[i+1], additional_conv_layer=True if i < 3 else False)
+                DecoderBlock(dec_filter[i], dec_filter[i + 1], additional_conv_layer=True if i < 3 else False)
             )
 
         # define task attention layers
@@ -328,11 +345,11 @@ class SegNet(MultiTaskModel):
         filter = self.filter[1:]
         filter.append(filter[-1])
         for i in range(len(self.encoder) - 1):
-            self.encoder[i] = AttentionBlockEncoder(self.encoder[i], filter[i], filter[i+1], self.n_tasks,
+            self.encoder[i] = AttentionBlockEncoder(self.encoder[i], filter[i], filter[i + 1], self.n_tasks,
                                                     first_block=True if i == 0 else False)
 
         for i in range(len(self.decoder)):
-            self.decoder[i] = AttentionBlockDecoder(self.decoder[i], dec_filter[i], dec_filter[i+1], self.n_tasks,
+            self.decoder[i] = AttentionBlockDecoder(self.decoder[i], dec_filter[i], dec_filter[i + 1], self.n_tasks,
                                                     index_intermediate=0)
 
         output_sizes = (self.class_nb, 1, 3)
@@ -359,20 +376,25 @@ class SegNet(MultiTaskModel):
     def forward(self, x):
 
         pool_indices = []
+        output_sizes = []
         x_task_specific = None
         for i, layer in enumerate(self.encoder[:-1]):
             x, x_task_specific = layer(x, input_task_specific=x_task_specific,
-                                           index_intermediate=0 if i == 0 else 1)
+                                       index_intermediate=0 if i == 0 else 1)
+            output_sizes.append(layer.pool_output_size)
             if type(x) is tuple and len(x) == 2:
                 pool_indices.append(x[1])
                 x = x[0]
+        output_sizes.append(x.size())
         x, pool_ind = self.encoder[-1](x)
         pool_indices.append(pool_ind)
 
         pool_indices = pool_indices[::-1]
+        output_sizes = output_sizes[::-1]
         for i, layer in enumerate(self.decoder):
-            x, x_task_specific = layer((x, pool_indices[i]), x_task_specific)
+            x, x_task_specific = layer((x, pool_indices[i]), x_task_specific, output_size=output_sizes[i])
         del pool_indices
+        del output_sizes
         del x
 
         # define task prediction layers
@@ -401,10 +423,10 @@ class SegNet(MultiTaskModel):
                 if hasattr(layer, 'attented_layer'):
                     if self.grad_hook_at_axon:
                         add_grad_hook(layer.attented_layer, self.n_tasks,
-                                                     name(i, None),
-                                                     self.grad_save_path, self.gradient_loggers)
+                                      name(i, None),
+                                      self.grad_save_path, self.gradient_loggers)
                     else:
-                        for conv_ind in (0, len(layer.attented_layer.layers) -1):
+                        for conv_ind in (0, len(layer.attented_layer.layers) - 1):
                             if type(layer.attented_layer.layers[conv_ind]) is nn.MaxPool2d or \
                                     type(layer.attented_layer.layers[conv_ind]) is nn.MaxUnpool2d:
                                 conv_ind_ = conv_ind + 1
@@ -421,6 +443,7 @@ class SegNet(MultiTaskModel):
     def last_shared_layer(self):
         return last_conv(self.decoder)
 
+
 # Doesn't work that well, probably too few parameters
 class ResNetUnet(MultiTaskModel):
     def __init__(self, device, pretrained=False, skip_connections=True, grad_hook_at_axon=True):
@@ -430,7 +453,6 @@ class ResNetUnet(MultiTaskModel):
         self.n_tasks = 3
 
         self.grad_hook_at_axon = grad_hook_at_axon
-
 
         self.resnet_unet = unet_learner_without_skip_connections(64, self.device,
                                                                  models.resnet34, pretrained=pretrained, metrics=None,
@@ -446,7 +468,6 @@ class ResNetUnet(MultiTaskModel):
         enc_filter = filter[:middle_ind]
         enc_filter.append(enc_filter[-1])
 
-
         # define task attention layers
 
         def replace_in(module_list, search_module, replace_module):
@@ -455,13 +476,14 @@ class ResNetUnet(MultiTaskModel):
                     module_list[i] = replace_module
 
         # encoder part
-        for i in range(1, middle_ind):   # first layer is just for conversion from 3 to 64 channels
+        for i in range(1, middle_ind):  # first layer is just for conversion from 3 to 64 channels
             replace_in(self.resnet_unet.layers,
                        attended_layers[i],
-                       AttentionBlockEncoder(attended_layers[i], enc_filter[i], filter[i+1],
+                       AttentionBlockEncoder(attended_layers[i], enc_filter[i], filter[i + 1],
                                              self.n_tasks,
                                              first_block=True if i == 1 else False,
-                                             downsampling=i < middle_ind-2    # no downsampling in last two attended layers
+                                             downsampling=i < middle_ind - 2
+                                             # no downsampling in last two attended layers
                                              )
                        )
 
@@ -471,14 +493,12 @@ class ResNetUnet(MultiTaskModel):
         for i in range(middle_ind, len(attended_layers)):
             replace_in(self.resnet_unet.layers,
                        attended_layers[i],
-                       AttentionBlockDecoder(attended_layers[i], filter[i], filter[i+1],
+                       AttentionBlockDecoder(attended_layers[i], filter[i], filter[i + 1],
                                              self.n_tasks, index_intermediate=None if i == middle_ind else 0,
                                              resnet=True, upsampling=i != middle_ind,
-                                             last_block_resnet=i == len(attended_layers)-1,
-                                             before_last_block_resnet=i==len(attended_layers)-2)
+                                             last_block_resnet=i == len(attended_layers) - 1,
+                                             before_last_block_resnet=i == len(attended_layers) - 2)
                        )
-
-
 
         output_sizes = (self.class_nb, 1, 3)
         if len(output_sizes) != self.n_tasks:
@@ -542,7 +562,7 @@ class ResNetUnet(MultiTaskModel):
 
 # TODO still has to be transformed to Unet like architecture
 class WideResNet(MultiTaskModel):
-    def __init__(self, num_classes, depth=28, widen_factor=4): # params from paper
+    def __init__(self, num_classes, depth=28, widen_factor=4):  # params from paper
         super(WideResNet, self).__init__()
         self.in_planes = 16
         n = int((depth - 4) / 6)
@@ -556,7 +576,6 @@ class WideResNet(MultiTaskModel):
         self.layer3 = self._wide_layer(WideResNet.wide_basic, filter[3], n, stride=2)
         self.bn1 = nn.BatchNorm2d(filter[3], momentum=0.9)
 
-
         # TODO: remove linear layer because its no classification
         # self.linear = nn.ModuleList([nn.Sequential(
         #     nn.Linear(filter[3], num_classes[0]),
@@ -569,7 +588,7 @@ class WideResNet(MultiTaskModel):
         self.n_tasks = 3
 
         for j in range(self.n_tasks):
-            if j < self.n_tasks-1:   # because he already started the list with one entry
+            if j < self.n_tasks - 1:  # because he already started the list with one entry
                 self.encoder_att.append(nn.ModuleList([self.att_layer([filter[0], filter[0], filter[0]])]))
             for i in range(3):
                 self.encoder_att[j].append(self.att_layer([2 * filter[i + 1], filter[i + 1], filter[i + 1]]))
@@ -654,7 +673,7 @@ class WideResNet(MultiTaskModel):
                     torch.cat((g_encoder[j], atten_encoder[k][j - 1][2]), dim=1))
                 atten_encoder[k][j][1] = (atten_encoder[k][j][0]) * g_encoder[j]
                 atten_encoder[k][j][2] = self.encoder_block_att[j](atten_encoder[k][j][1])
-                if j < 3:   # at the end there is not max_pool but avg_pool2d instead -> probably for the linear layers
+                if j < 3:  # at the end there is not max_pool but avg_pool2d instead -> probably for the linear layers
                     atten_encoder[k][j][2] = F.max_pool2d(atten_encoder[k][j][2], kernel_size=2, stride=2)
 
         pred = F.avg_pool2d(atten_encoder[k][-1][-1], 8)

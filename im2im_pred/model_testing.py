@@ -5,11 +5,10 @@ import architectures
 from create_dataset import NYUv2
 
 
-def evaluate_model(model, test_loader, device, index):
+def evaluate_model(model, test_loader, device, index, avg_cost, cost):
     # evaluating test data
+    avg_cost.fill(0.), cost.fill(0.)
     with torch.no_grad():  # operations inside don't track history
-
-        avg_cost = np.zeros(12, dtype=np.float32)
 
         for test_data, test_label, test_depth, test_normal in tqdm(test_loader, desc='Testing'):
             test_data, test_label = test_data.to(device), test_label.type(torch.LongTensor).to(device)
@@ -17,8 +16,6 @@ def evaluate_model(model, test_loader, device, index):
 
             test_pred, _ = model(test_data)
             test_loss = model.model_fit(test_pred[0], test_label, test_pred[1], test_depth, test_pred[2], test_normal)
-
-            cost = np.zeros(12, dtype=np.float32)
 
             cost[0] = test_loss[0].item()
             cost[1] = model.compute_miou(test_pred[0], test_label).item()
@@ -78,7 +75,7 @@ if __name__ == '__main__':
     loss_str = 'LOSS FORMAT: SEMANTIC_LOSS | MEAN_IOU PIX_ACC | DEPTH_LOSS | ABS_ERR REL_ERR | NORMAL_LOSS | MEAN MED <11.25 <22.5 <30\n'
 
     name_model_run = 'mtan_segnet_without_attention_dwa_run_0'
-    device = torch.device("cuda:{}".format(3) if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:{}".format(0) if torch.cuda.is_available() else "cpu")
 
     CHECKPOINT_PATH = Path('./logs/{}/model_checkpoints/checkpoint.chk'.format(name_model_run))
 

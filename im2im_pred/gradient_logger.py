@@ -1,5 +1,6 @@
 import os
 import pickle
+from multiprocessing import Lock, Process
 from pathlib import Path
 
 import torch
@@ -12,6 +13,10 @@ def css_whole_gradient(grad1, grad2):
     return F.cosine_similarity(grad1.flatten(), grad2.flatten(), dim=0).item()
 
 
+def css_whole_abs_gradient(grad1, grad2):
+    return css_whole_gradient(grad1.abs(), grad2.abs())
+
+
 def css_separate_filter(grad1, grad2):
     dim = 0
     if len(grad1.size()) != 1 and len(grad2.size()) != 1:
@@ -21,8 +26,12 @@ def css_separate_filter(grad1, grad2):
     return F.cosine_similarity(grad1, grad2, dim=dim).mean().item()
 
 
+def css_separate_filter_abs_gradient(grad1, grad2):
+    return css_separate_filter(grad1.abs(), grad2.abs())
+
+
 def euclidean_distance(grad1, grad2):
-    return (grad1-grad2).norm().item()
+    return torch.dist(grad1, grad2, 2).item()
 
 
 def chebyshev_distance(grad1, grad2):
@@ -34,10 +43,14 @@ def kohonen_similarity(grad1, grad2):
     return (inner / (inner + (grad1 - grad2).norm()**2)).item()
 
 
+def manhattan_distance(grad1, grad2):
+    return torch.dist(grad1, grad2, 1).item()
+
+
 class GradientLogger:
     created_save_path_dir = False
 
-    def __init__(self, n_tasks, layer_name, save_path, use_incremental_pca=True):
+    def __init__(self, n_tasks, layer_name, save_path, use_incremental_pca=False):
         self.n_tasks = n_tasks
         self.layer_name = layer_name
         self.save_path = Path(save_path)
@@ -46,6 +59,9 @@ class GradientLogger:
             os.makedirs(self.save_path.parent)
             GradientLogger.created_save_path_dir = True
 
+        self.lock_weights = Lock()
+        self.lock_biases = Lock()
+
         self.grad_list_weights = []
         self.grad_list_biases = []
 
@@ -53,9 +69,12 @@ class GradientLogger:
 
         self.similarity_metrics = [
             ('cosine_similarity_grad_{}_task{}_task{}', css_whole_gradient),
+            ('cosine_similarity_abs_grad_{}_task{}_task{}', css_whole_abs_gradient),
             ('cosine_similarity_separate_filter_grad_{}_task{}_task{}', css_separate_filter),
-            # ('euclidean_distance_grad_{}_task{}_task{}', euclidean_distance),
-            # ('chebyshev_distance_grad_{}_task{}_task{}', chebyshev_distance),
+            ('cosine_similarity_separate_filter_abs_grad_{}_task{}_task{}', css_separate_filter_abs_gradient),
+            ('euclidean_distance_grad_{}_task{}_task{}', euclidean_distance),
+            ('chebyshev_distance_grad_{}_task{}_task{}', chebyshev_distance),
+            ('manhattan_distance_grad_{}_task{}_task{}', manhattan_distance),
             ('kohonen_similarity_grad_{}_task{}_task{}', kohonen_similarity)
         ]
 
@@ -78,32 +97,39 @@ class GradientLogger:
             self.grad_metrics['incremental_pca_embedding'] = []
 
     def update_grad_list(self, module, grad_input, grad_output):
+        raise ValueError("Do not use this method.")
         # weights not 3x3, bc. grads from backward pass, not the ones applied to conv params
-        if len(grad_input) == 1:
-            ind = 0
-        else:
-            ind = 1
-        self.grad_list_weights.append(grad_input[ind].clone().detach().to('cpu'))
-        if hasattr(module, 'bias') and module.bias is not None:
-            self.grad_list_biases.append(grad_input[2].clone().detach().to('cpu'))
+        # prefer the hooks on params -> grad_hook_at_axon=False
+
+        # these are not really grads wrt weights but wrt to output of module
+        self.grad_list_weights.append(grad_output[0].sum(dim=0).clone().detach().to('cpu'))
         if len(self.grad_list_weights) == self.n_tasks:
             self.add_grad_metrics('weights')
             self.grad_list_weights = []
-            if hasattr(module, 'bias') and module.bias is not None:
-                self.add_grad_metrics('biases')
-                self.grad_list_biases = []
 
     def update_grad_list_param_weights(self, grad_input):
-        self.grad_list_weights.append(grad_input.clone().detach().to('cpu'))
+        Process(target=self.inner_update_grad_list_param_weights, args=(grad_input.clone().detach().to('cpu'),))
+        # self.inner_update_grad_list_param_weights(grad_input)
+
+    def inner_update_grad_list_param_weights(self, grad_input):
+        self.grad_list_weights.append(grad_input)
         if len(self.grad_list_weights) == self.n_tasks:
+            self.lock_weights.acquire()
             self.add_grad_metrics('weights')
             self.grad_list_weights = []
+            self.lock_weights.release()
 
     def update_grad_list_param_biases(self, grad_input):
-        self.grad_list_biases.append(grad_input.clone().detach().to('cpu'))
+        Process(target=self.inner_update_grad_list_param_biases, args=(grad_input.clone().detach().to('cpu'),)).start()
+        # self.inner_update_grad_list_param_biases(grad_input)
+
+    def inner_update_grad_list_param_biases(self, grad_input):
+        self.grad_list_biases.append(grad_input)
         if len(self.grad_list_biases) == self.n_tasks:
+            self.lock_biases.acquire()
             self.add_grad_metrics('biases')
             self.grad_list_biases = []
+            self.lock_biases.release()
 
     def add_grad_metrics(self, param_kind):
         param_kinds = {'weights': ('weights', self.grad_list_weights),

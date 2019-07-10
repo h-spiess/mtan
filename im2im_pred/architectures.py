@@ -12,7 +12,6 @@ from resnet_unet import unet_learner_without_skip_connections
 class MultiTaskModel(nn.Module):
     def __init__(self):
         super().__init__()
-        self.logsigma = nn.Parameter(torch.FloatTensor([-0.5, -0.5, -0.5]))
 
     def model_fit(self, x_pred1, x_output1, x_pred2, x_output2, x_pred3, x_output3):
         # binary mark to mask out undefined pixel space
@@ -49,7 +48,7 @@ class MultiTaskModel(nn.Module):
                                      torch.full(x_pred_label[i].shape, j, dtype=torch.long, device=self.device))
                 true_mask = torch.eq(x_output_label[i],
                                      torch.full(x_output_label[i].shape, j, dtype=torch.long, device=self.device))
-                mask_comb = pred_mask + true_mask
+                mask_comb = (pred_mask + true_mask) * (x_output_label[i] != -1)
                 union = torch.sum((mask_comb > 0).type(torch.FloatTensor))
                 intsec = torch.sum((mask_comb > 1).type(torch.FloatTensor))
                 if union == 0:
@@ -65,7 +64,7 @@ class MultiTaskModel(nn.Module):
             else:
                 batch_avg = class_prob / true_class + batch_avg
 
-        x_output = x_output.to('cpu')
+        _ = x_output.to('cpu')
         return batch_avg / batch_size
 
     def compute_iou(self, x_pred, x_output):
@@ -83,7 +82,7 @@ class MultiTaskModel(nn.Module):
                     torch.sum(torch.eq(x_pred_label[i], x_output_label[i]).type(torch.FloatTensor)),
                     torch.sum((x_output_label[i] >= 0).type(torch.FloatTensor)))
 
-        x_output = x_output.to('cpu')
+        _ = x_output.to('cpu')
         return pixel_acc / batch_size
 
     def depth_error(self, x_pred, x_output, rmse=True):
@@ -99,20 +98,27 @@ class MultiTaskModel(nn.Module):
             abs_err = torch.sqrt((x_pred_true - x_output_true) ** 2)
         rel_err = abs_err / x_output_true
 
-        x_output = x_output.to('cpu')
+        _ = x_output.to('cpu')
         return torch.sum(abs_err) / torch.nonzero(binary_mask).size(0), torch.sum(rel_err) / torch.nonzero(
             binary_mask).size(0)
 
     def normal_error(self, x_pred, x_output):
         x_output = x_output.to(self.device)
 
+        # surface vectors are normalized -> good
+
         binary_mask = (torch.sum(x_output, dim=1) != 0)
         error = torch.acos(
             torch.clamp(torch.sum(x_pred * x_output, 1).masked_select(binary_mask), -1, 1)).detach().cpu().numpy()
         error = np.degrees(error)
 
-        x_output = x_output.to('cpu')
+        _ = x_output.to('cpu')
         return np.mean(error), np.median(error), np.mean(error < 11.25), np.mean(error < 22.5), np.mean(error < 30)
+
+    def calculate_metrics_gradient_loggers(self):
+        for gradient_logger in self.gradient_loggers:
+            gradient_logger.add_grad_metrics('weights')
+            gradient_logger.add_grad_metrics('biases')
 
     def write_gradient_loggers(self):
         for gradient_logger in self.gradient_loggers:
@@ -255,7 +261,7 @@ class SegNetWithoutAttention(MultiTaskModel):
         t3_pred = self.pred_task[2](x)
         t3_pred = t3_pred / torch.norm(t3_pred, p=2, dim=1, keepdim=True)
 
-        return [t1_pred, t2_pred, t3_pred], self.logsigma
+        return [t1_pred, t2_pred, t3_pred]
 
     def gradient_logger_hooks(self, grad_save_path):
 
@@ -399,11 +405,11 @@ class SegNet(MultiTaskModel):
 
         # define task prediction layers
         t1_pred = F.log_softmax(self.pred_task[0](x_task_specific[0]), dim=1)
-        t2_pred = self.pred_task[1](x_task_specific[0])
-        t3_pred = self.pred_task[2](x_task_specific[0])
+        t2_pred = self.pred_task[1](x_task_specific[1])
+        t3_pred = self.pred_task[2](x_task_specific[2])
         t3_pred = t3_pred / torch.norm(t3_pred, p=2, dim=1, keepdim=True)
 
-        return [t1_pred, t2_pred, t3_pred], self.logsigma
+        return [t1_pred, t2_pred, t3_pred]
 
     def gradient_logger_hooks(self, grad_save_path):
 
@@ -536,7 +542,7 @@ class ResNetUnet(MultiTaskModel):
         t3_pred = self.pred_task[2](x_task_specific[0])
         t3_pred = t3_pred / torch.norm(t3_pred, p=2, dim=1, keepdim=True)
 
-        return [t1_pred, t2_pred, t3_pred], self.logsigma
+        return [t1_pred, t2_pred, t3_pred]
 
     def gradient_logger_hooks(self, grad_save_path):
 

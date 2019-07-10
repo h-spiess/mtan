@@ -1,12 +1,11 @@
 import os
 import pickle
-from multiprocessing import Lock, Process
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from torch import nn
 from sklearn.decomposition import IncrementalPCA
+from torch import nn
 
 
 def css_whole_gradient(grad1, grad2):
@@ -38,7 +37,7 @@ def chebyshev_distance(grad1, grad2):
     return (grad1-grad2).abs().max().item()
 
 
-def kohonen_similarity(grad1, grad2):
+def kohonen_similarity(grad1, grad2):   # just works for prob. distr. -> in original definition
     inner = (grad1.flatten() @ grad2.flatten())
     return (inner / (inner + (grad1 - grad2).norm()**2)).item()
 
@@ -47,10 +46,22 @@ def manhattan_distance(grad1, grad2):
     return torch.dist(grad1, grad2, 1).item()
 
 
+def jaccard_similarity(grad1, grad2):   # same as kohonen_similarity
+    sum_mul = torch.sum(grad1*grad2)
+    return (sum_mul / (torch.sum(grad1**2) + torch.sum(grad2**2) - sum_mul)).item()
+
+
+def simpson_similarity(grad1, grad2):
+    return (torch.sum(grad1*grad2)/torch.min(torch.sum(grad1), torch.sum(grad2))).item()
+
+
+def intersection_distance(grad1, grad2):
+    return (1-torch.sum(torch.min(grad1, grad2))/torch.min(torch.sum(grad1), torch.sum(grad2))).item()
+
 class GradientLogger:
     created_save_path_dir = False
 
-    def __init__(self, n_tasks, layer_name, save_path, use_incremental_pca=False):
+    def __init__(self, n_tasks, layer_name, save_path, use_incremental_pca=False, log_n_grad_sums=10):
         self.n_tasks = n_tasks
         self.layer_name = layer_name
         self.save_path = Path(save_path)
@@ -58,9 +69,6 @@ class GradientLogger:
         if not GradientLogger.created_save_path_dir:
             os.makedirs(self.save_path.parent)
             GradientLogger.created_save_path_dir = True
-
-        self.lock_weights = Lock()
-        self.lock_biases = Lock()
 
         self.grad_list_weights = []
         self.grad_list_biases = []
@@ -75,10 +83,16 @@ class GradientLogger:
             ('euclidean_distance_grad_{}_task{}_task{}', euclidean_distance),
             ('chebyshev_distance_grad_{}_task{}_task{}', chebyshev_distance),
             ('manhattan_distance_grad_{}_task{}_task{}', manhattan_distance),
-            ('kohonen_similarity_grad_{}_task{}_task{}', kohonen_similarity)
+            ('jaccard_similarity_grad_{}_task{}_task{}', jaccard_similarity),
+            ('simpson_similarity_grad_{}_task{}_task{}', simpson_similarity),
+            ('intersection_distance_grad_{}_task{}_task{}', intersection_distance),
         ]
 
         self.use_incremental_pca = use_incremental_pca
+
+        self.log_n_grad_sums = log_n_grad_sums
+        if self.log_n_grad_sums:
+            self.save_path_grad_sum_logs = self.save_path.parent / 'grad_sum_logs_{}.pickle'.format(layer_name)
 
         self.init_grad_metrics()
 
@@ -96,63 +110,92 @@ class GradientLogger:
         if self.use_incremental_pca:
             self.grad_metrics['incremental_pca_embedding'] = []
 
+        if self.log_n_grad_sums:
+            self.iteration_count = 0
+            self.grad_sum_logs = {'weights':
+                                      [[None] * self.log_n_grad_sums] * self.n_tasks,
+                                  'biases':
+                                      [[None] * self.log_n_grad_sums] * self.n_tasks}
+            self.grad_sum_logs_save = {}
+
     def update_grad_list(self, module, grad_input, grad_output):
         raise ValueError("Do not use this method.")
         # weights not 3x3, bc. grads from backward pass, not the ones applied to conv params
         # prefer the hooks on params -> grad_hook_at_axon=False
 
         # these are not really grads wrt weights but wrt to output of module
-        self.grad_list_weights.append(grad_output[0].sum(dim=0).clone().detach().to('cpu'))
+        self.grad_list_weights.append(grad_output[0].sum(dim=0).detach().clone().to('cpu'))
         if len(self.grad_list_weights) == self.n_tasks:
             self.add_grad_metrics('weights')
             self.grad_list_weights = []
 
     def update_grad_list_param_weights(self, grad_input):
-        Process(target=self.inner_update_grad_list_param_weights, args=(grad_input.clone().detach().to('cpu'),))
-        # self.inner_update_grad_list_param_weights(grad_input)
-
-    def inner_update_grad_list_param_weights(self, grad_input):
-        self.grad_list_weights.append(grad_input)
-        if len(self.grad_list_weights) == self.n_tasks:
-            self.lock_weights.acquire()
-            self.add_grad_metrics('weights')
-            self.grad_list_weights = []
-            self.lock_weights.release()
+        grad_detached = grad_input.detach().clone().to('cpu')
+        self.grad_list_weights.append(grad_detached)
+        self.log_grad_sum(grad_detached, 'weights')
 
     def update_grad_list_param_biases(self, grad_input):
-        Process(target=self.inner_update_grad_list_param_biases, args=(grad_input.clone().detach().to('cpu'),)).start()
-        # self.inner_update_grad_list_param_biases(grad_input)
+        grad_detached = grad_input.detach().clone().to('cpu')
+        self.grad_list_biases.append(grad_detached)
+        self.log_grad_sum(grad_detached, 'biases')
 
-    def inner_update_grad_list_param_biases(self, grad_input):
-        self.grad_list_biases.append(grad_input)
-        if len(self.grad_list_biases) == self.n_tasks:
-            self.lock_biases.acquire()
-            self.add_grad_metrics('biases')
-            self.grad_list_biases = []
-            self.lock_biases.release()
+    def log_grad_sum(self, grad, kind):
+        if self.log_n_grad_sums:
+            task_bin = self.iteration_count % self.n_tasks
+            log_bin = (self.iteration_count//self.n_tasks) % self.log_n_grad_sums
+            if self.grad_sum_logs[kind][task_bin][log_bin] is not None:
+                self.grad_sum_logs[kind][task_bin][log_bin] += grad
+            else:
+                self.grad_sum_logs[kind][task_bin][log_bin] = grad
 
     def add_grad_metrics(self, param_kind):
-        param_kinds = {'weights': ('weights', self.grad_list_weights),
-                       'biases': ('biases', self.grad_list_biases)}
+        param_kinds = {'weights': self.grad_list_weights,
+                       'biases': self.grad_list_biases}
         assert param_kind in param_kinds, 'Not valid param_kind: ' + param_kind
 
-        for name, grad_list in [param_kinds[param_kind]]:
-            for task_ind in range(len(grad_list)):
-                self.grad_metrics['norm_grad_{}_task{}'.format(name, task_ind + 1)].append(
-                    grad_list[task_ind].flatten().norm().item())
-                for task_ind_other in range(task_ind + 1, self.n_tasks):
-                    for similarity_metric, similarity_func in self.similarity_metrics:
-                        self.grad_metrics[similarity_metric.format(name, task_ind + 1,
-                                                                   task_ind_other + 1)].append(
-                            similarity_func(grad_list[task_ind], grad_list[task_ind_other])
-                        )
+        if len(param_kinds[param_kind]) >= self.n_tasks:
 
-        if param_kind == 'weights' and self.use_incremental_pca:
-            self.grad_metrics['incremental_pca_embedding'].append(self.incremental_pca())
+            for grad_list in [param_kinds[param_kind][:self.n_tasks]]:
+                for task_ind in range(len(grad_list)):
+                    self.grad_metrics['norm_grad_{}_task{}'.format(param_kind, task_ind + 1)].append(
+                        grad_list[task_ind].flatten().norm().item())
+                    for task_ind_other in range(task_ind + 1, self.n_tasks):
+                        for similarity_metric, similarity_func in self.similarity_metrics:
+                            self.grad_metrics[similarity_metric.format(param_kind, task_ind + 1,
+                                                                       task_ind_other + 1)].append(
+                                similarity_func(grad_list[task_ind], grad_list[task_ind_other])
+                            )
+
+            if param_kind == 'weights' and self.use_incremental_pca:
+                self.grad_metrics['incremental_pca_embedding'].append(self.incremental_pca())
+
+            if param_kind == 'weights':
+                self.grad_list_weights = self.grad_list_weights[self.n_tasks:]
+            else:
+                self.grad_list_biases = self.grad_list_biases[self.n_tasks:]
 
     def update_grad_metrics(self, epoch):
         self.grad_metrics_save['epoch{:03d}'.format(epoch)] = self.grad_metrics
+        if self.log_n_grad_sums:
+            self.grad_sum_logs_save['epoch{:03d}'.format(epoch)] = self.grad_sum_logs
+            self.write_grad_sum_logs()  # have to log it way more often
         self.init_grad_metrics()
+
+    def write_grad_sum_logs(self):
+        if self.log_n_grad_sums:
+            if os.path.exists(self.save_path_grad_sum_logs):
+                with open(self.save_path_grad_sum_logs, 'rb') as handle:
+                    grad_sum_logs = pickle.load(handle)
+            else:
+                grad_sum_logs = {}
+            if self.layer_name not in grad_sum_logs:
+                grad_sum_logs[self.layer_name] = {}
+
+            with open(self.save_path_grad_sum_logs, 'wb+') as handle:
+                grad_sum_logs[self.layer_name].update(self.grad_sum_logs_save)
+                pickle.dump(grad_sum_logs, handle)
+
+            self.grad_sum_logs_save = {}
 
     def write_grad_metrics(self):
         if os.path.exists(self.save_path):

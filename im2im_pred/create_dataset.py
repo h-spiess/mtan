@@ -27,7 +27,8 @@ class NYUv2(Dataset):
         self.shrinkage_factor = shrinkage_factor
 
         self.image_transforms = None
-        self.label_transforms = None
+        self.label_transforms_semantic = None
+        self.label_transforms_depth_normal = None
         if self.shrinkage_factor != 1:
             self.image_transforms = transforms.Compose([
                 transforms.ToPILImage(),
@@ -35,28 +36,46 @@ class NYUv2(Dataset):
                 transforms.ToTensor()
             ])
 
-            self.label_transforms = transforms.Compose([
+            self.label_transforms_semantic = transforms.Compose([
                 transforms.ToPILImage('I'),
+                transforms.Resize(int(288 // self.shrinkage_factor), 0),
+                transforms.ToTensor()
+            ])
+
+            self.label_transforms_depth_normal = transforms.Compose([
+                transforms.ToPILImage('F'),
                 transforms.Resize(int(288 // self.shrinkage_factor), 0),
                 transforms.ToTensor()
             ])
 
     def __getitem__(self, index):
         image = torch.from_numpy(np.moveaxis(np.load(self.data_path + '/image/{:d}.npy'.format(index)), -1, 0))
-        semantic = torch.from_numpy(np.load(self.data_path + '/label/{:d}.npy'.format(index)))
-        depth = torch.from_numpy(np.moveaxis(np.load(self.data_path + '/depth/{:d}.npy'.format(index)), -1, 0))
-        normal = torch.from_numpy(np.moveaxis(np.load(self.data_path + '/normal/{:d}.npy'.format(index)), -1, 0))
+
+        if self.label_transforms_semantic:
+            semantic = np.load(self.data_path + '/label/{:d}.npy'.format(index)).astype(np.int32)
+        else:
+            semantic = torch.from_numpy(np.load(self.data_path + '/label/{:d}.npy'.format(index)))
+
+        if self.label_transforms_depth_normal:
+            depth = np.load(self.data_path + '/depth/{:d}.npy'.format(index)).astype(np.float32)
+            normal = np.load(self.data_path + '/normal/{:d}.npy'.format(index)).astype(np.float32)
+        else:
+            depth = torch.from_numpy(np.moveaxis(np.load(self.data_path + '/depth/{:d}.npy'.format(index)), -1, 0))
+            normal = torch.from_numpy(np.moveaxis(np.load(self.data_path + '/normal/{:d}.npy'.format(index)), -1, 0))
 
         image = image.type(torch.FloatTensor)
-        semantic = semantic.type(torch.IntTensor)
-        depth = depth.type(torch.FloatTensor)
-        normal = normal.type(torch.FloatTensor)
+        if not self.label_transforms_depth_normal:
+            depth = depth.type(torch.FloatTensor)
+            normal = normal.type(torch.FloatTensor)
 
-        if self.image_transforms is not None and self.label_transforms is not None:
+        if self.image_transforms and self.label_transforms_semantic and self.label_transforms_depth_normal:
             image = self.image_transforms(image)
-            semantic = self.label_transforms(semantic)
-            depth = self.image_transforms(depth)
-            normal = self.image_transforms(normal)
+            semantic = self.label_transforms_semantic(semantic)
+            depth = self.label_transforms_depth_normal(depth)
+            normal_x = self.label_transforms_depth_normal(normal[:, :, 0])
+            normal_y = self.label_transforms_depth_normal(normal[:, :, 1])
+            normal_z = self.label_transforms_depth_normal(normal[:, :, 2])
+            normal = torch.stack((normal_x, normal_y, normal_z), dim=0).squeeze()
 
         return image, semantic.squeeze().type(torch.FloatTensor), depth, normal
 

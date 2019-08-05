@@ -180,9 +180,6 @@ class SegNetWithoutAttention(MultiTaskModel):
         # add batchnorm -> in paper they are just in the task specific parts
         # he uses it: see conv_layer
 
-        # define pooling and unpooling functions
-        self.up_sampling = nn.MaxUnpool2d(kernel_size=2, stride=2)
-
         # define encoder decoder layers
 
         # encoder
@@ -267,6 +264,7 @@ class SegNetWithoutAttention(MultiTaskModel):
 
         self.grad_save_path = grad_save_path
         self.gradient_loggers = []
+        self.hooked_params_or_modules = []
 
         def gradient_logger_hooks_encoder_decoder(enc_dec, block_name):
 
@@ -277,12 +275,13 @@ class SegNetWithoutAttention(MultiTaskModel):
             for layer in enc_dec:
                 if isinstance(layer, EncoderBlock) or isinstance(layer, DecoderBlock):
                     if self.grad_hook_at_axon:
-                        add_grad_hook(layer, self.n_tasks,
-                                      name(i, None),
-                                      self.grad_save_path, self.gradient_loggers)
+                        self.hooked_params_or_modules += add_grad_hook(layer, self.n_tasks,
+                                                                       name(i, None),
+                                                                       self.grad_save_path, self.gradient_loggers)
                     else:
-                        create_last_conv_hook_at(layer, self.n_tasks, name(i, None), self.grad_save_path,
-                                                 self.gradient_loggers)
+                        self.hooked_params_or_modules += create_last_conv_hook_at(layer, self.n_tasks, name(i, None),
+                                                                                  self.grad_save_path,
+                                                                                  self.gradient_loggers)
                     i += 1
 
         gradient_logger_hooks_encoder_decoder(self.encoder, 'encoder')
@@ -315,9 +314,6 @@ class SegNet(MultiTaskModel):
 
         # add batchnorm -> in paper they are just in the task specific parts
         # he uses it: see conv_layer
-
-        # define pooling and unpooling functions
-        self.up_sampling = nn.MaxUnpool2d(kernel_size=2, stride=2)
 
         # define encoder decoder layers
 
@@ -415,6 +411,7 @@ class SegNet(MultiTaskModel):
 
         self.grad_save_path = grad_save_path
         self.gradient_loggers = []
+        self.hooked_params_or_modules = []
 
         def gradient_logger_hooks_encoder_decoder(enc_dec, block_name):
 
@@ -428,9 +425,9 @@ class SegNet(MultiTaskModel):
             for layer in enc_dec:
                 if hasattr(layer, 'attented_layer'):
                     if self.grad_hook_at_axon:
-                        add_grad_hook(layer.attented_layer, self.n_tasks,
-                                      name(i, None),
-                                      self.grad_save_path, self.gradient_loggers)
+                        self.hooked_params_or_modules += add_grad_hook(layer.attented_layer, self.n_tasks,
+                                                                       name(i, None),
+                                                                       self.grad_save_path, self.gradient_loggers)
                     else:
                         for conv_ind in (0, len(layer.attented_layer.layers) - 1):
                             if type(layer.attented_layer.layers[conv_ind]) is nn.MaxPool2d or \
@@ -438,9 +435,10 @@ class SegNet(MultiTaskModel):
                                 conv_ind_ = conv_ind + 1
                             else:
                                 conv_ind_ = conv_ind
-                            create_last_conv_hook_at(layer.attented_layer.layers[conv_ind_], self.n_tasks,
-                                                     name(i, conv_ind),
-                                                     self.grad_save_path, self.gradient_loggers)
+                            self.hooked_params_or_modules += create_last_conv_hook_at(
+                                layer.attented_layer.layers[conv_ind_], self.n_tasks,
+                                name(i, conv_ind),
+                                self.grad_save_path, self.gradient_loggers)
                     i += 1
 
         gradient_logger_hooks_encoder_decoder(self.encoder, 'encoder')
@@ -450,6 +448,7 @@ class SegNet(MultiTaskModel):
         return last_conv(self.decoder)
 
 
+# UNMAINTAINED
 # Doesn't work that well, probably too few parameters
 class ResNetUnet(MultiTaskModel):
     def __init__(self, device, pretrained=False, skip_connections=True, grad_hook_at_axon=True):
@@ -557,7 +556,7 @@ class ResNetUnet(MultiTaskModel):
             i = 0
             for layer in enc_dec:
                 if hasattr(layer, 'attented_layer'):
-                    create_last_conv_hook_at(layer.attented_layer, self.n_tasks,
+                    self.hooked_params_or_modules += create_last_conv_hook_at(layer.attented_layer, self.n_tasks,
                                              name(i),
                                              self.grad_save_path, self.gradient_loggers)
                     i += 1

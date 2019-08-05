@@ -97,7 +97,7 @@ class DecoderBlock(nn.Module):
 
 class AttentionBlock(nn.Module):
 
-    def __init__(self, attented_layer, shared_feature_extractor, n_tasks, save_attention_mask=True):
+    def __init__(self, attented_layer, shared_feature_extractor, n_tasks, save_attention_mask=False):
         super().__init__()
         self.attented_layer = attented_layer
         self.shared_feature_extractor = shared_feature_extractor

@@ -111,11 +111,12 @@ class GradientLogger:
             self.grad_metrics['incremental_pca_embedding'] = []
 
         if self.log_n_grad_sums:
-            self.iteration_count = 0
+            self.iteration_count = {'weights': 0, 'biases': 0}
             self.grad_sum_logs = {'weights':
-                                      [[None] * self.log_n_grad_sums] * self.n_tasks,
+                                      [[None for _ in range(0, self.log_n_grad_sums)] for _ in range(0, self.n_tasks)],
                                   'biases':
-                                      [[None] * self.log_n_grad_sums] * self.n_tasks}
+                                      [[None for _ in range(0, self.log_n_grad_sums)] for _ in range(0, self.n_tasks)],
+                                  }
             self.grad_sum_logs_save = {}
 
     def update_grad_list(self, module, grad_input, grad_output):
@@ -141,12 +142,13 @@ class GradientLogger:
 
     def log_grad_sum(self, grad, kind):
         if self.log_n_grad_sums:
-            task_bin = self.iteration_count % self.n_tasks
-            log_bin = (self.iteration_count//self.n_tasks) % self.log_n_grad_sums
+            task_bin = self.iteration_count[kind] % self.n_tasks
+            log_bin = (self.iteration_count[kind]//self.n_tasks) % self.log_n_grad_sums
             if self.grad_sum_logs[kind][task_bin][log_bin] is not None:
                 self.grad_sum_logs[kind][task_bin][log_bin] += grad
             else:
                 self.grad_sum_logs[kind][task_bin][log_bin] = grad
+            self.iteration_count[kind] += 1
 
     def add_grad_metrics(self, param_kind):
         param_kinds = {'weights': self.grad_list_weights,
@@ -242,7 +244,7 @@ def last_conv(module):
 
 
 def create_last_conv_hook_at(module, n_tasks, name, grad_save_path, gradient_loggers):
-    add_grad_hook_conv_params(last_conv(module), n_tasks, name, grad_save_path, gradient_loggers)
+    return add_grad_hook_conv_params(last_conv(module), n_tasks, name, grad_save_path, gradient_loggers)
 
 
 def add_grad_hook_conv_params(module, n_tasks, name, grad_save_path, gradient_loggers):
@@ -257,10 +259,13 @@ def add_grad_hook_conv_params(module, n_tasks, name, grad_save_path, gradient_lo
     module.bias.register_hook(
         grad_logger.update_grad_list_param_biases)
 
+    return [module.weight, module.bias]
+
 
 def add_grad_hook(module, n_tasks, name, grad_save_path, gradient_loggers):
     module.register_backward_hook(
         append_and_return(gradient_loggers, GradientLogger(n_tasks, name, grad_save_path)).update_grad_list)
+    return [module]
 
 
 def append_and_return(gradient_loggers, gradient_logger):

@@ -256,7 +256,7 @@ class MultitaskAdam(MultitaskOptimizer):
                                 prev_bias_correction2) / prev_bias_correction1
 
                             # to compensate the smaller learning rate because norm per filter is smaller
-                            h *= h.numel()
+                            # h *= h.numel()
                         elif len(task_grad.size()) == 4:
                             # this multiplication should be okay -> matrixcalculus gave back an diag matrix
                             # which is the same as element-wise
@@ -265,7 +265,7 @@ class MultitaskAdam(MultitaskOptimizer):
                                 prev_bias_correction2) / prev_bias_correction1
 
                             # to compensate the smaller learning rate because norm per filter is smaller
-                            h *= h.numel()
+                            # h *= h.numel()
                         else:
                             raise ValueError("Param has not 4 (conv) or 1 (bias) dimension. Size: ", task_grad.size())
                         # Hypergradient descent of the learning rate:

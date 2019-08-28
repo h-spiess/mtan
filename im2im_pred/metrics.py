@@ -17,8 +17,13 @@ class PixelAccuracy(Callback):
 
     def on_batch_end(self, last_output:Tensor, last_target:Tensor, **kwargs:Any):
         for sample in range(last_output.size()[0]):
-            _, p_c, p_l = pixelAccuracy(last_output[sample, :, :, :].argmax(dim=0).cpu().numpy(),
-                                          last_target[sample, :, :].cpu().numpy())
+            p_c, p_l = pixelAccuracy(last_output[sample, :, :, :].argmax(dim=0).cpu().numpy(),
+                                          last_target[sample, :, :].cpu().numpy(), self.num_classes)
+
+            if not self.mean_over_classes:
+                p_c = p_c.sum()
+                p_l = p_l.sum()
+
             self.pixel_corrects.append(p_c)
             self.pixel_labeled.append(p_l)
 
@@ -26,9 +31,8 @@ class PixelAccuracy(Callback):
         pixel_corrects = np.array(self.pixel_corrects)
         pixel_labeled = np.array(self.pixel_labeled)
 
-        self.metric = 1.0 * np.sum(pixel_corrects) / (np.spacing(1) + np.sum(pixel_labeled))
-        if not self.mean_over_classes:
-            raise NotImplementedError('PixelAccuracy only available as mean.')
+        self.metric = 1.0 * np.sum(pixel_corrects, axis=0) / (np.spacing(1) + np.sum(pixel_labeled, axis=0))
+        self.metric = self.metric.mean()
 
 
 class IntersectionOverUnion(Callback):
@@ -82,6 +86,8 @@ class DepthErrors(Callback):
     def on_epoch_end(self, **kwargs:Any):
         self.metric = (self.sum_abs_error / self.sum_non_zero,
                        self.sum_rel_error / self.sum_non_zero)
+        if self.rmse:
+            self.metric = (torch.sqrt(self.metric[0]), self.metric[1])
 
 
 def depth_error(x_pred, x_output, rmse=True):
@@ -92,7 +98,7 @@ def depth_error(x_pred, x_output, rmse=True):
     if not rmse:
         abs_err = torch.abs(x_pred_true - x_output_true)
     else:
-        abs_err = torch.sqrt((x_pred_true - x_output_true) ** 2)
+        abs_err = (x_pred_true - x_output_true) ** 2
     rel_error = abs_err/x_output_true
 
     _ = x_output.to('cpu')
@@ -164,12 +170,11 @@ def intersectionAndUnion(imPred, imLab, numClass, missing=-1):
     # imPred = np.asarray(imPred)
     # imLab = np.asarray(imLab)
 
-    # Remove classes from unlabeled pixels in gt image.
-    # We should not penalize detections in unlabeled portions of the image.
-    imPred = imPred * ((imLab != missing)*2 - 1)
-
     # Compute area intersection:
-    intersection = imPred * ((imPred == imLab)*2 - 1)
+    intersection = imPred.copy()
+    intersection[imPred != imLab] = missing
+    # Missing labels are automatically -1 in intersection, as imPred >= 0 and therefore does not contain -1's
+
     (area_intersection, _) = np.histogram(intersection, bins=numClass, range=(0, numClass))
 
     # Compute area union:
@@ -177,10 +182,10 @@ def intersectionAndUnion(imPred, imLab, numClass, missing=-1):
     (area_lab, _) = np.histogram(imLab, bins=numClass, range=(0, numClass))
     area_union = area_pred + area_lab - area_intersection
 
-    return (area_intersection, area_union)
+    return area_intersection, area_union
 
 
-def pixelAccuracy(imPred, imLab, missing=-1):
+def pixelAccuracy(imPred, imLab, numClass, missing=-1):
     # This function takes the prediction and label of a single image, returns pixel-wise accuracy
     # To compute over many images do:
     # for i = range(Nimages):
@@ -192,11 +197,16 @@ def pixelAccuracy(imPred, imLab, missing=-1):
 
     # Remove classes from unlabeled pixels in gt image.
     # We should not penalize detections in unlabeled portions of the image.
-    pixel_labeled = np.sum(imLab != missing)
-    pixel_correct = np.sum((imPred == imLab) * (imLab != missing))
-    pixel_accuracy = 1.0 * pixel_correct / pixel_labeled
+    (pixel_labeled, _) = np.histogram(imLab, bins=numClass, range=(0, numClass))
 
-    return (pixel_accuracy, pixel_correct, pixel_labeled)
+    # Compute area intersection:
+    intersection = imPred.copy()
+    intersection[imPred != imLab] = missing
+    # Missing labels are automatically -1 in intersection, as imPred >= 0 and therefore does not contain -1's
+
+    (pixel_correct, _) = np.histogram(intersection, bins=numClass, range=(0, numClass))
+
+    return pixel_correct, pixel_labeled
 
 def test_iou_fastai_vs_challenge():
     np.random.seed(42)

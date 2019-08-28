@@ -12,17 +12,17 @@ import numpy as np
 def reduce_add(l, factors=None):
     if not factors or isinstance(factors[0], float):
         sum = l[0] if not factors else factors[0] * l[0]
-    elif len(factors[0].size()) == 1:
+    elif len(l[0].size()) == 1:
         sum = l[0] if not factors else factors[0] * l[0]
     else:
-        sum = l[0] if not factors else factors[0].unsqueeze(2).unsqueeze(3) * l[0]
+        sum = l[0] if not factors else factors[0].unsqueeze(1).unsqueeze(2).unsqueeze(3) * l[0]
     for i, e in enumerate(l[1:]):
         if not factors or isinstance(factors[i+1], float):
             sum += e if not factors else factors[i+1] * e
-        elif len(factors[0].size()) == 1:
+        elif len(l[i+1].size()) == 1:
             sum = e if not factors else factors[i+1] * e
         else:
-            sum += e if not factors else factors[i + 1].unsqueeze(2).unsqueeze(3) * e
+            sum += e if not factors else factors[i + 1].unsqueeze(1).unsqueeze(2).unsqueeze(3) * e
     return sum
 
 
@@ -54,7 +54,7 @@ class MultitaskOptimizer(Optimizer):
         self.state['task_grads'][p].clear()
 
     def remove_first_task_grad(self, p):
-        self.state['task_grads'][p].pop(0)
+        self.state['task_grads'][p][0] = None
 
     def step(self, closure):
         r"""Performs a single optimization step (parameter update).
@@ -115,7 +115,6 @@ class MultitaskOptimizer(Optimizer):
             group['optimizer_logs_save'] = {}
 
     def log_task_weights(self, p, task_weights, group):
-        # TODO log average
         if group['param_to_log_map'].get(p):
             if p in group['optimizer_logs']:
                 if len(task_weights) > 0 and (isinstance(task_weights[0], float) or len(task_weights[0].size()) == 0):
@@ -130,13 +129,29 @@ class MultitaskOptimizer(Optimizer):
                 group['optimizer_logs'][p] = [scalar_tensor_list_to_item_list(task_weights)]
                 group['optimizer_logs_counts'][p] = 1
 
+    def multiplicative_update_step(self, group, h, multiplicative_rule_normalization):
+        invalid_normalization_indices = torch.isclose(multiplicative_rule_normalization,
+                                                      torch.zeros_like(
+                                                          multiplicative_rule_normalization))
+        multiplicative_update = group['hypergrad_lr'] * h.div_(multiplicative_rule_normalization)
+        # change NaN to 0 to not change the mixing weight if 0 in normalization
+        # number_nans = (multiplicative_update != multiplicative_update).sum()
+        # if number_nans > 0:
+        #     print('{} filters have NaN in multiplicative rule normalization.'.format(number_nans))
+        # multiplicative_update[multiplicative_update != multiplicative_update] = 0.
+        multiplicative_update[invalid_normalization_indices] = 0.
+        # update can not be bigger than 1 (scalar product / norms = -1 <= cosine <= 1)
+        multiplicative_update.clamp_(min=-1., max=1.)
+        return multiplicative_update
+
 
 class MultitaskAdam(MultitaskOptimizer):
     r"""Implements Multitask Adam algorithm.
     """
 
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8,
-                 weight_decay=0, amsgrad=False, hypergrad_lr=None, per_filter=True):
+                 weight_decay=0, amsgrad=False, hypergrad_lr=None, multiplicative_rule=True, per_filter=True,
+                 logging=True, model=None):
         if not 0.0 <= lr:
             raise ValueError("Invalid learning rate: {}".format(lr))
         if not 0.0 <= eps:
@@ -149,11 +164,13 @@ class MultitaskAdam(MultitaskOptimizer):
             raise ValueError("Invalid hypergradient learning rate: {}".format(hypergrad_lr))
         if hypergrad_lr and amsgrad:
             raise ValueError("Hypergradient learning descent not compatible with amsgrad for now")
-        if per_filter and hypergrad_lr is None:
-            raise ValueError("Per_filter has to be combined with hypergradient learning")
+        if hypergrad_lr is None:
+            per_filter = False
+
+        self.model = model
 
         if hypergrad_lr:
-            logging = True
+            logging = logging
             parameter_name_map = None
             optimizer_logs = {}
             optimizer_logs_counts = {}
@@ -166,7 +183,9 @@ class MultitaskAdam(MultitaskOptimizer):
             optimizer_logs_save = None
 
         defaults = dict(lr=lr, betas=betas, eps=eps,
-                        weight_decay=weight_decay, amsgrad=amsgrad, hypergrad_lr=hypergrad_lr, per_filter=per_filter,
+                        weight_decay=weight_decay, amsgrad=amsgrad, hypergrad_lr=hypergrad_lr,
+                        multiplicative_rule=multiplicative_rule,
+                        per_filter=per_filter,
                         logging=logging, parameter_name_map=parameter_name_map,
                         optimizer_logs=optimizer_logs, optimizer_logs_counts=optimizer_logs_counts,
                         optimizer_logs_save=optimizer_logs_save)
@@ -197,6 +216,7 @@ class MultitaskAdam(MultitaskOptimizer):
                     raise RuntimeError('Adam does not support sparse gradients, please consider SparseAdam instead')
                 amsgrad = group['amsgrad']
                 hypergrad_lr = group['hypergrad_lr']
+                multiplicative_rule = group['multiplicative_rule']
 
                 state = self.state[p]
                 n_tasks = len(task_grads)
@@ -222,7 +242,7 @@ class MultitaskAdam(MultitaskOptimizer):
                             state['lr'] = [torch.full(p.data.size(), group['lr']).to(p.data.device)
                                            for _ in range(n_tasks)]
                         elif len(p.data.size()) == 4:
-                            state['lr'] = [torch.full(p.data.size()[0:2], group['lr']).to(p.data.device)
+                            state['lr'] = [torch.full(p.data.size()[0:1], group['lr']).to(p.data.device)
                                            for _ in range(n_tasks)]
                         else:
                             raise ValueError("Param has not 4 (conv) or 1 (bias) dimension. Size: ", p.data.size())
@@ -235,7 +255,11 @@ class MultitaskAdam(MultitaskOptimizer):
 
                 step_size = group['lr']
 
+                multiplicative_rule_normalization = 1.
+
+                loop_run = False
                 for i, task_grad in enumerate(task_grads):
+                    loop_run = True
                     exp_avg, exp_avg_sq = state['exp_avg'][i], state['exp_avg_sq'][i]
                     if amsgrad:
                         max_exp_avg_sq = state['max_exp_avg_sq'][i]
@@ -248,28 +272,46 @@ class MultitaskAdam(MultitaskOptimizer):
                         prev_bias_correction2 = 1 - beta2 ** (state['step'] - 1)
                         # Hypergradient for Adam:
                         if not group['per_filter']:
-                            h = torch.dot(task_grad.view(-1),
-                                          -torch.div(exp_avg, exp_avg_sq.sqrt().add_(group['eps'])).view(
-                                              -1)) * math.sqrt(prev_bias_correction2) / prev_bias_correction1
+                            grad_h = -torch.div(exp_avg, exp_avg_sq.sqrt().add_(group['eps'])).mul_(
+                                *math.sqrt(prev_bias_correction2) / prev_bias_correction1)
+                            h = torch.dot(task_grad.view(-1), grad_h.view(-1))
+
+                            if multiplicative_rule:
+                                multiplicative_rule_normalization = task_grad.norm() * grad_h.norm()
+
                         elif len(task_grad.size()) == 1:
-                            h = task_grad * -torch.div(exp_avg, exp_avg_sq.sqrt().add_(group['eps'])) * math.sqrt(
-                                prev_bias_correction2) / prev_bias_correction1
+                            grad_h = -torch.div(exp_avg, exp_avg_sq.sqrt().add_(group['eps'])).mul_(
+                                math.sqrt(prev_bias_correction2) / prev_bias_correction1)
+                            h = task_grad * grad_h
+
+                            if multiplicative_rule:
+                                multiplicative_rule_normalization = task_grad.norm() * grad_h
 
                             # to compensate the smaller learning rate because norm per filter is smaller
                             # h *= h.numel()
                         elif len(task_grad.size()) == 4:
                             # this multiplication should be okay -> matrixcalculus gave back an diag matrix
                             # which is the same as element-wise
-                            h = (task_grad * -torch.div(exp_avg, exp_avg_sq.sqrt().add_(
-                                group['eps']))).sum(dim=(2, 3)) * math.sqrt(
-                                prev_bias_correction2) / prev_bias_correction1
+                            grad_h = -torch.div(exp_avg, exp_avg_sq.sqrt().add_(group['eps'])).mul_(
+                                math.sqrt(prev_bias_correction2) / prev_bias_correction1)
+                            h = (task_grad * grad_h).sum(dim=(1, 2, 3))
+
+                            # TODO
+                            if multiplicative_rule:
+                                multiplicative_rule_normalization = task_grad.norm() * grad_h.sum(dim=(1, 2, 3))
 
                             # to compensate the smaller learning rate because norm per filter is smaller
                             # h *= h.numel()
                         else:
                             raise ValueError("Param has not 4 (conv) or 1 (bias) dimension. Size: ", task_grad.size())
                         # Hypergradient descent of the learning rate:
-                        state['lr'][i] -= group['hypergrad_lr'] * h
+                        if not multiplicative_rule:
+                            state['lr'][i] -= group['hypergrad_lr'] * h
+                        else:
+                            multiplicative_update = self.multiplicative_update_step(group, h,
+                                                                                    multiplicative_rule_normalization)
+
+                            state['lr'][i] *= (1 - multiplicative_update)
                         step_size = state['lr'][i]
 
                     # Decay the first and second moment running average coefficient
@@ -286,12 +328,16 @@ class MultitaskAdam(MultitaskOptimizer):
 
                     if not group['per_filter'] or isinstance(step_size, float) or len(step_size.size()) == 0:
                         p.data.addcdiv_(-step_size*bias_correction, exp_avg, denom)
-                    elif len(step_size.size()) == 1:
-                        p.data.addcdiv_(-bias_correction, exp_avg.mul_(step_size), denom)
-                    elif len(step_size.size()) == 2:
-                        p.data.addcdiv_(-bias_correction, exp_avg.mul_(step_size.unsqueeze(2).unsqueeze(3)), denom)
+                    elif len(p.size()) == 1:
+                        p.data.addcdiv_(-bias_correction, exp_avg * step_size, denom)
+                    elif len(p.size()) == 4:
+                        p.data.addcdiv_(-bias_correction, exp_avg * step_size.unsqueeze(1).unsqueeze(2).unsqueeze(3),
+                                        denom)
                     else:
-                        raise ValueError("Param has not 4 (conv) or 1 (bias) dimension. Size: ", step_size.size())
+                        raise ValueError("Param has not 4 (conv) or 1 (bias) dimension. Size: ", p.size())
+
+                if loop_run:
+                    self.clear_task_grads(p)
 
                 if group['logging']:
                     self.log_task_weights(p, state['lr'], group)
@@ -320,14 +366,17 @@ class MultitaskAdamHD(MultitaskAdam):
         https://openreview.net/forum?id=BkrsAzWAb
     """
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8,
-                 weight_decay=0, hypergrad_lr=1e-7, per_filter=True):
+                 weight_decay=0, hypergrad_lr=1e-2, multiplicative_rule=True, per_filter=True, logging=True, model=None):
         super(MultitaskAdamHD, self).__init__(params, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
-                                              amsgrad=False, hypergrad_lr=hypergrad_lr, per_filter=per_filter)
+                                              amsgrad=False, hypergrad_lr=hypergrad_lr,
+                                              multiplicative_rule=multiplicative_rule, per_filter=per_filter,
+                                              logging=logging, model=model)
 
 
 class MultitaskAdamMixingHD(MultitaskOptimizer):
-    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, hypergrad_lr=1e-7,
-                 normalize_mixing_weights=True, per_filter=True, test_grad_eps=None):
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, hypergrad_lr=1e-2, multiplicative_rule=True,
+                 normalize_and_clamp_mixing_weights=True, per_filter=True, test_grad_eps=None, logging=True,
+                 model=None):
         if not 0.0 <= lr:
             raise ValueError("Invalid learning rate: {}".format(lr))
         if not 0.0 <= eps:
@@ -339,8 +388,10 @@ class MultitaskAdamMixingHD(MultitaskOptimizer):
         if not 0.0 <= hypergrad_lr:
             raise ValueError("Invalid hypergradient learning rate: {}".format(hypergrad_lr))
 
-        if hypergrad_lr:
-            logging = True
+        self.model = model
+
+        if hypergrad_lr:    # additive in paper: 1e-7, mulitplicative in paper: 1e-2
+            logging = logging
             parameter_name_map = None
             optimizer_logs = {}
             optimizer_logs_counts = {}
@@ -352,8 +403,8 @@ class MultitaskAdamMixingHD(MultitaskOptimizer):
             optimizer_logs_counts = None
             optimizer_logs_save = None
 
-        defaults = dict(lr=lr, betas=betas, eps=eps, hypergrad_lr=hypergrad_lr,
-                        normalize_mixing_weights=normalize_mixing_weights, per_filter=per_filter,
+        defaults = dict(lr=lr, betas=betas, eps=eps, hypergrad_lr=hypergrad_lr, multiplicative_rule=multiplicative_rule,
+                        normalize_and_clamp_mixing_weights=normalize_and_clamp_mixing_weights, per_filter=per_filter,
                         test_grad_eps=test_grad_eps,
                         logging=logging, parameter_name_map=parameter_name_map,
                         optimizer_logs=optimizer_logs, optimizer_logs_counts=optimizer_logs_counts,
@@ -388,6 +439,7 @@ class MultitaskAdamMixingHD(MultitaskOptimizer):
                 if task_grads[0].is_sparse:
                     raise RuntimeError('Adam does not support sparse gradients, please consider SparseAdam instead')
                 hypergrad_lr = group['hypergrad_lr']
+                multiplicative_rule = group['multiplicative_rule']
 
                 state = self.state[p]
                 n_tasks = len(task_grads)
@@ -406,7 +458,7 @@ class MultitaskAdamMixingHD(MultitaskOptimizer):
                         state['mixing_factors'] = [torch.full(p.data.size(), 1.0).to(p.data.device)
                                                    for _ in range(n_tasks)]
                     elif len(p.data.size()) == 4:
-                        state['mixing_factors'] = [torch.full(p.data.size()[0:2], 1.0).to(p.data.device)
+                        state['mixing_factors'] = [torch.full(p.data.size()[0:1], 1.0).to(p.data.device)
                                                    for _ in range(n_tasks)]
                     else:
                         raise ValueError("Param has not 4 (conv) or 1 (bias) dimension. Size: ", p.data.size())
@@ -462,21 +514,30 @@ class MultitaskAdamMixingHD(MultitaskOptimizer):
                         beta_1_ratio * prev_exp_avg_sq_corrected_sqrt).div_(prev_exp_avg_sq_corrected_sqrt ** 2)
 
                     # this is multiplied here because every gradient w.r.t. to mixing factor has to be multiplied by g_t
-                    h_mixing_const.mul_(group['lr']).mul_(unmixed_grad)
+                    h_mixing_const.mul_(group['lr'])
+                    if not multiplicative_rule:
+                        h_mixing_const.mul_(unmixed_grad)
 
                     del prev_exp_avg_corrected
                     del prev_exp_avg_sq_corrected_sqrt
                     del prev_mixed_grad
                     self.state['prev_task_grads'][p] = []
 
+                    multiplicative_rule_normalization = 1
+
                     for i, task_grad in enumerate(task_grads):
                         if test_grad_exit:
                             continue
 
                         if not group['per_filter']:
-                            # mixing const is multiplied with prev. grad
-                            # (switched prev. grad and current grad to have more constant)
-                            h_mixing = torch.dot(h_mixing_const.view(-1), prev_task_grads[i].view(-1)).item()
+                            if multiplicative_rule:
+                                grad_h_mixing = h_mixing_const * prev_task_grads[i]
+                                multiplicative_rule_normalization = unmixed_grad.norm() * grad_h_mixing.norm()
+                                h_mixing = torch.dot(grad_h_mixing.view(-1), unmixed_grad.view(-1)).item()
+                            else:
+                                # mixing const is multiplied with prev. grad
+                                # (switched prev. grad and current grad to have more constant)
+                                h_mixing = torch.dot(h_mixing_const.view(-1), prev_task_grads[i].view(-1)).item()
 
                             if group['test_grad_eps'] and return_h is None:
                                 return_h = h_mixing
@@ -485,7 +546,12 @@ class MultitaskAdamMixingHD(MultitaskOptimizer):
                                 continue
 
                         elif len(prev_task_grads[i].size()) == 1:
-                            h_mixing = h_mixing_const * prev_task_grads[i]
+                            if multiplicative_rule:
+                                grad_h_mixing = h_mixing_const * prev_task_grads[i]
+                                multiplicative_rule_normalization = unmixed_grad.norm() * grad_h_mixing
+                                h_mixing = grad_h_mixing.mul_(unmixed_grad)
+                            else:
+                                h_mixing = h_mixing_const * prev_task_grads[i]
 
                             if group['test_grad_eps'] and return_h is None:
                                 return_h = h_mixing.clone()
@@ -497,9 +563,14 @@ class MultitaskAdamMixingHD(MultitaskOptimizer):
                             # -> but the changes to the mixing factors sum up at the end
                             # h_mixing *= h_mixing.numel()
                         elif len(prev_task_grads[i].size()) == 4:
-                            # this multiplication should be okay -> matrixcalculus gave back an diag matrix
-                            # which is the same as element-wise
-                            h_mixing = (h_mixing_const * prev_task_grads[i]).sum(dim=(2, 3))
+                            if multiplicative_rule:
+                                grad_h_mixing = h_mixing_const * prev_task_grads[i]
+                                multiplicative_rule_normalization = unmixed_grad.norm() * grad_h_mixing.sum(dim=(1, 2, 3))
+                                h_mixing = grad_h_mixing.mul_(unmixed_grad).sum(dim=(1, 2, 3))
+                            else:
+                                # this multiplication should be okay -> matrixcalculus gave back an diag matrix
+                                # which is the same as element-wise
+                                h_mixing = (h_mixing_const * prev_task_grads[i]).sum(dim=(1, 2, 3))
 
                             if group['test_grad_eps'] and return_h is None:
                                 return_h = h_mixing.clone()
@@ -515,13 +586,26 @@ class MultitaskAdamMixingHD(MultitaskOptimizer):
                             raise ValueError("Param has not 4 (conv) or 1 (bias) dimension. Size: ",
                                              prev_task_grads[i].size())
 
-                        state['mixing_factors'][i] -= group['hypergrad_lr'] * h_mixing
+                        if not multiplicative_rule:
+                            state['mixing_factors'][i] -= group['hypergrad_lr'] * h_mixing
+                        else:
+                            multiplicative_update = self.multiplicative_update_step(group, h_mixing,
+                                                                                    multiplicative_rule_normalization)
 
-                if not test_grad_exit and group['normalize_mixing_weights']:
+                            state['mixing_factors'][i] *= (1 - multiplicative_update)
+
+                if not test_grad_exit and group['normalize_and_clamp_mixing_weights']:
                     sum_mixing_weights = 0
                     for i in range(len(task_grads)):
                         # tried removing the abs here
                         # sum_mixing_weights += abs(state['mixing_factors'][i])
+
+                        # clamping to ensure mixing factors are >= 0 (projected gradient descent)
+                        if isinstance(state['mixing_factors'][i], float):
+                            state['mixing_factors'][i] = max(0., state['mixing_factors'][i])
+                        else:
+                            state['mixing_factors'][i] = state['mixing_factors'][i].clamp_(min=0.)
+
                         sum_mixing_weights += state['mixing_factors'][i]
                     if (isinstance(sum_mixing_weights, float) and np.allclose(sum_mixing_weights, 0.)) or (
                             not isinstance(sum_mixing_weights, float) and torch.allclose(
@@ -536,7 +620,7 @@ class MultitaskAdamMixingHD(MultitaskOptimizer):
                 if not group['per_filter'] or len(task_grads[0].size()) == 1:
                     mixed_grad = state['mixing_factors'][0] * task_grads[0]
                 elif len(task_grads[0].size()) == 4:
-                    mixed_grad = state['mixing_factors'][0].unsqueeze(2).unsqueeze(3) * task_grads[0]
+                    mixed_grad = state['mixing_factors'][0].unsqueeze(1).unsqueeze(2).unsqueeze(3) * task_grads[0]
                 else:
                     raise ValueError("Param has not 4 (conv) or 1 (bias) dimension. Size: ", task_grads[0].size())
 
@@ -545,7 +629,7 @@ class MultitaskAdamMixingHD(MultitaskOptimizer):
                         if not group['per_filter'] or len(task_grads[i].size()) == 1:
                             mixed_grad += state['mixing_factors'][i] * task_grads[i]
                         elif len(task_grads[i].size()) == 4:
-                            mixed_grad += state['mixing_factors'][i].unsqueeze(2).unsqueeze(3) * task_grads[i]
+                            mixed_grad += state['mixing_factors'][i].unsqueeze(1).unsqueeze(2).unsqueeze(3) * task_grads[i]
                         else:
                             raise ValueError("Param has not 4 (conv) or 1 (bias) dimension. Size: ",
                                              task_grads[i].size())
@@ -565,13 +649,21 @@ class MultitaskAdamMixingHD(MultitaskOptimizer):
                 if test_grad_exit:
                     return return_h
 
-                # TODO log less if factor per filter
                 # only the conv layers where the gradients are logged
                 # log moving average twice per epoch
                 if not group['test_grad_eps'] and group['logging']:
                     self.log_task_weights(p, state['mixing_factors'], group)
 
         return loss
+
+
+class MultitaskAdamLinearCombinationHD(MultitaskAdamMixingHD):
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, hypergrad_lr=1e-2, multiplicative_rule=True,
+                 per_filter=True, test_grad_eps=None, logging=True,
+                 model=None):
+        super().__init__(params, normalize_and_clamp_mixing_weights=False, lr=lr, betas=betas, eps=eps,
+                         hypergrad_lr=hypergrad_lr, multiplicative_rule=multiplicative_rule,
+                         per_filter=per_filter, test_grad_eps=test_grad_eps, logging=logging, model=model)
 
 
 def scalar_tensor_list_to_item_list(tensor_list):

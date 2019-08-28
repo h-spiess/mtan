@@ -1,4 +1,8 @@
 import os
+
+from matplotlib.lines import Line2D
+
+os.environ['PATH'] = '/home/spiess/anaconda3/envs/thesis/bin:/home/spiess/anaconda3/condabin:' + os.environ['PATH']
 import shutil
 import sys
 from collections import defaultdict
@@ -19,6 +23,19 @@ import architectures
 from create_dataset import NYUv2
 from metrics import IntersectionOverUnion, PixelAccuracy, DepthErrors
 from multitask_optimizers import MultitaskAdamMixingHD
+
+import matplotlib.pyplot as plt
+from matplotlib import rc
+
+rc('text', usetex=True)
+# charter as first font
+plt.rcParams['text.latex.preamble'] = [r'\usepackage[libertine]{newtxmath}']
+plt.rcParams['font.serif'][0], plt.rcParams['font.serif'][-2] = plt.rcParams['font.serif'][-2], \
+                                                                plt.rcParams['font.serif'][0]
+plt.rcParams['font.family'] = 'serif'
+
+plt.interactive(False)
+import math
 
 
 def correlation_matrix(activations, SPLITROWS=100):
@@ -100,13 +117,17 @@ def pixelAccuracy(imPred, imLab, missing=-1):
     return (pixel_accuracy, pixel_correct, pixel_labeled)
 
 
-def evaluate_model(model, test_loader, device, index, avg_cost, cost, test=False, input_dissimilarity=False):
+def evaluate_model(model, test_loader, device, index, avg_cost, cost, pixel_acc_mean_over_classes=True, test=False, input_dissimilarity=False):
     model.eval()
 
+    if not hasattr(model, 'class_weights'):
+        class_weights = torch.ones(model.class_nb)
+        model.class_weights = class_weights.to(device)
+
     miou_metric = IntersectionOverUnion(-1, model.class_nb)
-    iou_metric = PixelAccuracy(-1, model.class_nb)
+    pixel_acc_metric = PixelAccuracy(-1, model.class_nb, mean_over_classes=pixel_acc_mean_over_classes)
     depth_errors = DepthErrors(rmse=True)
-    metric_callbacks = [(miou_metric, 0), (iou_metric, 0), (depth_errors, 1)]
+    metric_callbacks = [(miou_metric, 0), (pixel_acc_metric, 0), (depth_errors, 1)]
 
     area_intersections = []
     area_unions = []
@@ -118,7 +139,7 @@ def evaluate_model(model, test_loader, device, index, avg_cost, cost, test=False
         original_batch_costs = np.zeros(4, np.float32)
 
         metric_batches = {miou_metric: [],
-                          iou_metric: []}
+                          pixel_acc_metric: []}
 
     for cb, _ in metric_callbacks:
         cb.on_epoch_begin()
@@ -148,7 +169,7 @@ def evaluate_model(model, test_loader, device, index, avg_cost, cost, test=False
             for cb, ind in metric_callbacks:
                 cb.on_batch_end(test_pred[ind], test_labels[ind].to(model.device))
                 if test:
-                    if cb is miou_metric or cb is iou_metric:
+                    if cb is miou_metric or cb is pixel_acc_metric:
                         cb.on_epoch_end()
                         metric_batches[cb].append(cb.metric)
                         # intersectionAndUnion(test_pred[ind].numpy(), test_labels[ind].numpy(), model.class_nb)
@@ -178,7 +199,6 @@ def evaluate_model(model, test_loader, device, index, avg_cost, cost, test=False
             # calculates the mean of medians -> no on-line algo for medians available / possible
             cost[7], cost[8], cost[9], cost[10], cost[11] = model.normal_error(test_pred[2], test_normal)
 
-            # TODO probably this averaging is not okay for these metrics
             avg_cost += cost / len(test_loader)
 
         for cb, _ in metric_callbacks:
@@ -194,7 +214,6 @@ def evaluate_model(model, test_loader, device, index, avg_cost, cost, test=False
         if test:
             area_intersections = np.array(area_intersections)
             area_unions = np.array(area_unions)
-            pixel_accuracies = np.array(pixel_accuracies)
             pixel_corrects = np.array(pixel_corrects)
             pixel_labeled = np.array(pixel_labeled)
 
@@ -202,7 +221,7 @@ def evaluate_model(model, test_loader, device, index, avg_cost, cost, test=False
             mean_pixel_accuracy = 1.0 * np.sum(pixel_corrects) / (np.spacing(1) + np.sum(pixel_labeled))
 
         avg_cost[1] = miou_metric.metric
-        avg_cost[2] = iou_metric.metric
+        avg_cost[2] = pixel_acc_metric.metric
         avg_cost[4] = depth_errors.metric[0]
         avg_cost[5] = depth_errors.metric[1]
 
@@ -258,7 +277,7 @@ def test_multitask_adam_mixing_hd_grads(CHECKPOINT_PATH, device, ModelClass=None
     # plus eps
     model = load_model(CHECKPOINT_PATH, device, ModelClass=ModelClass, **kwargs)
     model.train()
-    optimizer = MultitaskAdamMixingHD(model.parameters(), lr=1e-4*math.sqrt(2), test_grad_eps=test_grad_eps,
+    optimizer = MultitaskAdamMixingHD(model.parameters(), lr=1e-4 * math.sqrt(2), test_grad_eps=test_grad_eps,
                                       per_filter=False)
 
     def forw(model, optimizer):
@@ -289,7 +308,7 @@ def test_multitask_adam_mixing_hd_grads(CHECKPOINT_PATH, device, ModelClass=None
     # minus eps
     model = load_model(CHECKPOINT_PATH, device, ModelClass=ModelClass, **kwargs)
     model.train()
-    optimizer = MultitaskAdamMixingHD(model.parameters(), lr=1e-4*math.sqrt(2), test_grad_eps=-test_grad_eps,
+    optimizer = MultitaskAdamMixingHD(model.parameters(), lr=1e-4 * math.sqrt(2), test_grad_eps=-test_grad_eps,
                                       per_filter=False)
 
     _ = forw(model, optimizer)
@@ -308,7 +327,99 @@ def test_multitask_adam_mixing_hd_grads(CHECKPOINT_PATH, device, ModelClass=None
     pass
 
 
-def calculate_artificial_css(CHECKPOINT_PATH, device, ModelClass=None, one_head=True, **kwargs):
+def calculate_artificial_css(CHECKPOINT_PATH, device, ModelClass=None, one_head=True, segmentation=True, **kwargs):
+
+    # def dice_loss(true, logits, eps=1e-7):
+    #     """Computes the Sørensen–Dice loss.
+    #     Note that PyTorch optimizers minimize a loss. In this
+    #     case, we would like to maximize the dice loss so we
+    #     return the negated dice loss.
+    #     Args:
+    #         true: a tensor of shape [B, 1, H, W].
+    #         logits: a tensor of shape [B, C, H, W]. Corresponds to
+    #             the raw output or logits of the model.
+    #         eps: added to the denominator for numerical stability.
+    #     Returns:
+    #         dice_loss: the Sørensen–Dice loss.
+    #     """
+    #     num_classes = logits.shape[1]
+    #     if num_classes == 1:
+    #         true_1_hot = torch.eye(num_classes + 1)[true.squeeze(1)]
+    #         true_1_hot = true_1_hot.permute(0, 3, 1, 2).float()
+    #         true_1_hot_f = true_1_hot[:, 0:1, :, :]
+    #         true_1_hot_s = true_1_hot[:, 1:2, :, :]
+    #         true_1_hot = torch.cat([true_1_hot_s, true_1_hot_f], dim=1)
+    #         pos_prob = torch.sigmoid(logits)
+    #         neg_prob = 1 - pos_prob
+    #         probas = torch.cat([pos_prob, neg_prob], dim=1)
+    #     else:
+    #         true_1_hot = torch.eye(num_classes)[true.squeeze(1)]
+    #         true_1_hot = true_1_hot.permute(0, 3, 1, 2).float()
+    #         probas = F.softmax(logits, dim=1)
+    #     true_1_hot = true_1_hot.type(logits.type())
+    #     dims = (0,) + tuple(range(2, true.ndimension()))
+    #     intersection = torch.sum(probas * true_1_hot, dims)
+    #     cardinality = torch.sum(probas + true_1_hot, dims)
+    #     dice_loss = (2. * intersection / (cardinality + eps)).mean()
+    #     return (1 - dice_loss)
+
+    def to_one_hot(tensor, nClasses):
+        n, h, w = tensor.size()
+        one_hot = torch.zeros(n, nClasses, h, w).to(tensor.device).scatter_(1, tensor.view(n, 1, h, w), 1)
+        return one_hot
+
+    def dice_loss(pred, target, classes=13):
+        """This definition generalize to real valued pred and target vector.
+    This should be differentiable.
+        pred: tensor with first dimension as batch
+        target: tensor with first dimension as batch
+        """
+
+        pred = pred.exp()
+        target = to_one_hot(target.argmax(dim=1), classes)
+
+        smooth = 1.
+
+        # have to use contiguous since they may from a torch.view op
+        iflat = pred.contiguous().view(-1)
+        tflat = target.contiguous().view(-1)
+        intersection = (iflat * tflat).sum()
+
+        A_sum = torch.sum(iflat * iflat)
+        B_sum = torch.sum(tflat * tflat)
+
+        return 1 - ((2. * intersection + smooth) / (A_sum + B_sum + smooth))
+
+    def jaccard_loss(inputs, target, classes=13, eps=1e-7):
+
+        inputs = inputs.exp()
+        target = to_one_hot(target.argmax(dim=1), classes)
+
+        """Paper: Optimizing Intersection-Over-Union in Deep Neural Networks for Image Segmentation.
+        """
+        # inputs => N x Classes x H x W
+        # target_oneHot => N x Classes x H x W
+
+        N = inputs.size()[0]
+
+        # predicted probabilities for each pixel along channel
+        inputs = F.softmax(inputs, dim=1)
+
+        # Numerator Product
+        inter = inputs * target
+        ## Sum over all pixels N x C x H x W => N x C
+        inter = inter.view(N, classes, -1).sum(2)
+
+        # Denominator
+        union = inputs + target- (inputs * target)
+        ## Sum over all pixels N x C x H x W => N x C
+        union = union.view(N, classes, -1).sum(2)
+
+        loss = inter / union
+
+        ## Return average loss over classes and batch
+        return 1-loss.mean()
+
     model = load_model(CHECKPOINT_PATH, device, ModelClass=ModelClass, **kwargs)
     model.train()
     save_path = Path('./logs/artificial_css/')
@@ -321,40 +432,55 @@ def calculate_artificial_css(CHECKPOINT_PATH, device, ModelClass=None, one_head=
         input = torch.randn(1, 3, 100, 100).to(device)
         output = model.forward(input)
         if one_head:
-            output = output[0]
-            target = torch.rand(1).to(device) * torch.ones_like(output)
-            loss_1 = F.mse_loss(output, target)
-            loss_2 = F.l1_loss(output, target)
-            loss_1_square = F.mse_loss(output, target)**2
+            output = output[0]  # is log softmax
+            # target = torch.rand(1).to(device) * torch.ones_like(output)
+            target = torch.randint_like(output, 0, 13)
+            if segmentation:
+                loss_dice = dice_loss(output, target)
+                loss_jaccard = jaccard_loss(output, target)
+                target_max = target.argmax(dim=1)
+                loss_cross = F.nll_loss(output, target_max.long())
+                losses = (loss_dice, loss_jaccard, loss_cross)
+                # print(losses)
+                loss_vs_names = ('Dice, Jaccard', 'Dice, NLL', 'Jaccard, NLL')
+            else:
+                loss_1 = F.mse_loss(output, target)
+                loss_2 = F.l1_loss(output, target)
+                loss_1_square = F.mse_loss(output, target) ** 2
+                losses = (loss_1, loss_2, loss_1_square)
+                loss_vs_names = ('L1, L2', 'L1, L1$^2$', 'L2, L1$^2$')
         else:
             rand_scalar = torch.rand(1).to(device)
-            loss_1 = F.mse_loss(output[0], rand_scalar * torch.ones_like(output[0]))
-            loss_2 = F.l1_loss(output[1], rand_scalar * torch.ones_like(output[1]))
-            loss_1_square = F.mse_loss(output[2], rand_scalar * torch.ones_like(output[2])) ** 2
-        loss_1.backward(retain_graph=True)
-        loss_2.backward(retain_graph=True)
-        loss_1_square.backward()
+            if segmentation:
+                raise ValueError("Multihead and segmentation together makes no sense!")
+            else:
+                loss_1 = F.mse_loss(output[0], rand_scalar * torch.ones_like(output[0]))
+                loss_2 = F.l1_loss(output[1], rand_scalar * torch.ones_like(output[1]))
+                loss_1_square = F.mse_loss(output[2], rand_scalar * torch.ones_like(output[2])) ** 2
+                losses = (loss_1, loss_2, loss_1_square)
+                loss_vs_names = ('L1, L2', 'L1, L1$^2$', 'L2, L1$^2$')
+        losses[0].backward(retain_graph=True)
+        losses[1].backward(retain_graph=True)
+        losses[2].backward()
         model.calculate_metrics_gradient_loggers()
     artificial_css = [[[] for _ in range(3)] for _ in range(len(model.gradient_loggers))]
-    for i, gradient_logger in enumerate(model.gradient_loggers):
+    for i, gradient_logger in enumerate(model.gradient_loggers[::-1]):
         artificial_css[i][0] += gradient_logger.grad_metrics['cosine_similarity_grad_weights_task1_task2']
         artificial_css[i][1] += gradient_logger.grad_metrics['cosine_similarity_grad_weights_task1_task3']
         artificial_css[i][2] += gradient_logger.grad_metrics['cosine_similarity_grad_weights_task2_task3']
     artificial_css = np.array(artificial_css)
-    return artificial_css
+    return artificial_css, loss_vs_names
 
 
-def plot_artificial_css(artificial_css, one_head):
-    x = xr.DataArray(artificial_css, dims=('layers', 'loss_kinds', 'observations'),
-                     coords={'layers': [i for i in range(artificial_css.shape[0])],
-                             'loss_kinds': ['mse_vs_l1',
-                                            'mse_vs_mse_sq',
-                                            'l1_vs_mse_sq'],
-                             'observations': [i for i in
+def plot_artificial_css(artificial_css, one_head, loss_vs_names):
+    x = xr.DataArray(artificial_css, dims=('Depth', 'Losses', 'Observations'),
+                     coords={'Depth': [i for i in range(artificial_css.shape[0])],
+                             'Losses': list(loss_vs_names),
+                             'Observations': [i for i in
                                               range(artificial_css.shape[-1])]})
-    df = x.to_dataframe('artificial_css').reset_index()
+    df = x.to_dataframe('Cosine similarity').reset_index()
     plt.figure()
-    ax = sns.barplot(x="layers", y="artificial_css", hue='loss_kinds', data=df)
+    ax = sns.barplot(x="Depth", y="Cosine similarity", hue='Losses', data=df)
     ax.set_title('One Head' if one_head else 'Separate Heads')
     plt.show()
     plt.savefig(Path('./logs/artificial_css/{}.pdf'.format('one_head' if one_head else 'separate_heads')))
@@ -362,6 +488,7 @@ def plot_artificial_css(artificial_css, one_head):
 
 def evaluate_saved_model(CHECKPOINT_PATH, device, ModelClass=None, test=False, input_dissimilarity=False, **kwargs):
     dataset_path = 'data/nyuv2'
+    #TODO change to train=False again
     nyuv2_test_set = NYUv2(root=dataset_path, train=False)
     batch_size = 2
     num_workers = 2
@@ -383,7 +510,14 @@ def evaluate_saved_model(CHECKPOINT_PATH, device, ModelClass=None, test=False, i
 def write_performance(name_model_run, performance, loss_str):
     PERFORMANCE_PATH = Path('./logs/{}/'.format(name_model_run))
     os.makedirs(PERFORMANCE_PATH, exist_ok=True)
-    with open(PERFORMANCE_PATH / 'final_performance.txt', 'w') as handle:
+
+    final_performance_str = 'final_performance{}.txt'
+    if os.path.exists(PERFORMANCE_PATH / 'final_performance.txt'):
+        final_performance_str = final_performance_str.format('_extra_test')
+    else:
+        final_performance_str = final_performance_str.format('')
+
+    with open(PERFORMANCE_PATH / final_performance_str, 'w+') as handle:
         handle.write(loss_str)
         handle.write(performance)
 
@@ -408,13 +542,27 @@ def plot_input_dissimilarity(input_dissimilarity):
     plt.show()
 
 
-import matplotlib.pyplot as plt
+def plot_metrics(name_models, metrics):
+    def create_label(name_model):
+        n = 'SN' if 'segnet_without_attention' in name_model else 'SNA'
+        n += '+'
+        if 'equal' in name_model:
+            n += 'EQ'
+        elif 'dwa' in name_model:
+            n += 'DWA'
+        elif 'gradnorm' in name_model:
+            n += 'GN'
+        n += '+'
+        if 'multitask_adam_hd' in name_model:
+            n += 'MTAHD'
+        elif 'multitask_adam_linear_combination_hd' in name_model:
+            n += 'ALC'
+        elif 'multitask_adam' in name_model:
+            n += 'MTA'
+        elif 'adam' in name_model:
+            n += 'A'
+        return n
 
-plt.interactive(False)
-import math
-
-
-def plot_metrics(CHECKPOINT_PATH, metrics):
     metric_name_to_ind = {
         'segmentation_loss': 0,
         'segmentation_miou': 1,
@@ -453,33 +601,42 @@ def plot_metrics(CHECKPOINT_PATH, metrics):
     for m in metrics:
         assert m in metric_name_to_ind, 'Unknown metric: ' + str(m)
 
-    metrics_data = torch.load(CHECKPOINT_PATH)['avg_cost']
-    metrics_data = metrics_data[~np.all(metrics_data == 0, axis=1)]
+    CHECKPOINT_PATHS = [Path('./logs/{}/model_checkpoints/checkpoint.chk'.format(name_model)) for name_model in name_models]
+    metrics_datas = [torch.load(CHECKPOINT_PATH)['avg_cost'] for CHECKPOINT_PATH in CHECKPOINT_PATHS]
+    metrics_datas = [metrics_data[~np.all(metrics_data == 0, axis=1)] for metrics_data in metrics_datas]
 
     ncols = 2
     fig, axs = plt.subplots(math.ceil(len(metrics) / ncols), ncols)
     axs = axs.reshape(-1)
     fig.suptitle('Metrics')
 
-    nepochs = metrics_data.shape[0]
+    nepochs = [metrics_data.shape[0] for metrics_data in metrics_datas]
+    assert len(set(nepochs)) == 1
+    nepochs = nepochs[0]
 
     xtrain = np.arange(0.5, 0.5 + nepochs)
     xtest = np.arange(1, 1 + nepochs)
 
+    name_models = [create_label(name_model) for name_model in name_models]
+
     for i, m in enumerate(metrics):
-        colors = sns.color_palette()
+        for j, metrics_data in enumerate(metrics_datas):
+            colors = sns.color_palette()
 
-        axs[i].plot(xtrain, metrics_data[:, metric_name_to_ind[m]], '--', color=colors[i % len(colors)],
-                    label=m + '_train')
-        axs[i].plot(xtest, metrics_data[:, metric_name_to_ind[m] + 12], color=colors[i % len(colors)],
-                    label=m + '_test')
-        opt_ind = metric_name_to_opt_funcs[m][0](metrics_data[:, metric_name_to_ind[m] + 12])
-        opt = metric_name_to_opt_funcs[m][1](metrics_data[:, metric_name_to_ind[m] + 12])
-        axs[i].scatter([xtest[opt_ind]], [opt], facecolors='none', marker='o', color=colors[i % len(colors)])
-        axs[i].axvline(x=xtest[opt_ind], color=colors[i % len(colors)], alpha=0.5)
-        axs[i].axhline(y=opt, color=colors[i % len(colors)], alpha=0.5)
+            axs[i].plot(xtrain, metrics_data[:, metric_name_to_ind[m]], '--', color=colors[j % len(colors)])
+            axs[i].plot(xtest, metrics_data[:, metric_name_to_ind[m] + 12], color=colors[j % len(colors)],
+                        label=name_models[j].replace('_', ' '))
+            opt_ind = metric_name_to_opt_funcs[m][0](metrics_data[:, metric_name_to_ind[m] + 12])
+            opt = metric_name_to_opt_funcs[m][1](metrics_data[:, metric_name_to_ind[m] + 12])
+            axs[i].scatter([xtest[opt_ind]], [opt], facecolors='none', marker='o', color=colors[j % len(colors)])
+            axs[i].axvline(x=xtest[opt_ind], color=colors[j % len(colors)], alpha=0.5)
+            axs[i].axhline(y=opt, color=colors[j % len(colors)], alpha=0.5)
         axs[i].legend()
+        axs[i].set_title(m.replace('_', ' '))
 
+    labels = ['Train', 'Test']
+    lines = [Line2D([0], [0], color='black', linewidth=1, linestyle='--' if l == 'Train' else None) for l in labels]
+    fig.legend(lines, labels, ncol=2, loc='lower center')
     plt.show()
 
 
@@ -532,12 +689,15 @@ def plot_mds_embedding_input_rdms(rdms):
 if __name__ == '__main__':
     loss_str = 'LOSS FORMAT: SEMANTIC_LOSS | MEAN_IOU PIX_ACC | DEPTH_LOSS | ABS_ERR REL_ERR | NORMAL_LOSS | MEAN MED <11.25 <22.5 <30\n'
 
-    name_model_run = 'mtan_segnet_without_attention_dwa_multitask_adam_hd_run_4'
+    name_model_run = 'mtan_segnet_without_attention_equal_adam_run_1'
+    model_class = None
+
     # TODO pay attention to gpu
     device = 1
     os.environ['CUDA_VISIBLE_DEVICES'] = str(device)
     print('RUN ON GPU: ' + str(device))
     device = torch.device("cuda:{}".format(device) if torch.cuda.is_available() else "cpu")
+    # device = 'cpu'
 
     CHECKPOINT_PATH = Path('./logs/{}/model_checkpoints/checkpoint.chk'.format(name_model_run))
 
@@ -551,36 +711,40 @@ if __name__ == '__main__':
         'normals_loss',
         'normals_angle_dist_mean'
     ]
-    # plot_metrics(CHECKPOINT_PATH, metrics)
+    plot_metrics([
+        'mtan_segnet_without_attention_equal_adam_run_1',
+        'mtan_segnet_without_attention_dwa_adam_run_3',
+        'mtan_segnet_dwa_adam_run_6'
+    ], metrics)
 
     input_dissimilarity = False
 
-    test_multitask_adam_mixing_hd_grads(CHECKPOINT_PATH, device, ModelClass=architectures.SegNetWithoutAttention)
-    sys.exit(0)
+    # test_multitask_adam_mixing_hd_grads(CHECKPOINT_PATH, device, ModelClass=architectures.SegNetWithoutAttention)
+    # sys.exit(0)
 
-    one_head = False
-    artificial_css = calculate_artificial_css(CHECKPOINT_PATH, device, ModelClass=architectures.SegNetWithoutAttention,
-                                              one_head=one_head)
-    plot_artificial_css(artificial_css, one_head)
-
-    sys.exit(0)
+    # one_head = True
+    # artificial_css, loss_vs_names = calculate_artificial_css(CHECKPOINT_PATH, device, ModelClass=model_class,
+    #                                           one_head=one_head)
+    # plot_artificial_css(artificial_css, one_head, loss_vs_names)
+    #
+    # sys.exit(0)
 
     # plot_input_dissimilarity_from_file(Path('./logs/{}/input_dissimilarity.npy'.format(name_model_run)))
 
-    corr_matrix = correlation_matrix_of_rdms_from_names([name_model_run for _ in range(10)])
-    plot_correlation_matrix_of_rdms(corr_matrix)
+    # corr_matrix = correlation_matrix_of_rdms_from_names([name_model_run for _ in range(10)])
+    # plot_correlation_matrix_of_rdms(corr_matrix)
 
-    plot_mds_embedding_input_rdms(rdms_from_names([name_model_run for _ in range(10)]))
+    # plot_mds_embedding_input_rdms(rdms_from_names([name_model_run for _ in range(10)]))
 
     # TODO pay attention to model class
     test = False
     if test:
         avg_cost, performance, metrics_per_batch, original_batch_costs, places_challenge_metrics = \
-            evaluate_saved_model(CHECKPOINT_PATH, device, ModelClass=architectures.SegNetWithoutAttention, test=test,
+            evaluate_saved_model(CHECKPOINT_PATH, device, ModelClass=model_class, test=test,
                                  input_dissimilarity=input_dissimilarity)
     else:
         ret = \
-            evaluate_saved_model(CHECKPOINT_PATH, device, ModelClass=architectures.SegNetWithoutAttention,
+            evaluate_saved_model(CHECKPOINT_PATH, device, ModelClass=model_class,
                                  input_dissimilarity=input_dissimilarity)
         if input_dissimilarity:
             avg_cost, performance, input_dissimilarity = ret

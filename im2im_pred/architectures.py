@@ -19,10 +19,10 @@ class MultiTaskModel(nn.Module):
 
         # semantic loss: depth-wise cross entropy
         x_output1 = x_output1.to(self.device)
-        loss1 = F.nll_loss(x_pred1, x_output1, ignore_index=-1)
+        loss1 = F.nll_loss(x_pred1, x_output1, ignore_index=-1, weight=self.class_weights)
         x_output1.to('cpu')
 
-        # depth loss: l1 norm
+        # depth loss: mean abs error
         x_output2 = x_output2.to(self.device)
         loss2 = torch.sum(torch.abs(x_pred2 - x_output2) * binary_mask) / torch.nonzero(binary_mask).size(0)
         x_output2.to('cpu')
@@ -32,7 +32,7 @@ class MultiTaskModel(nn.Module):
         loss3 = 1 - torch.sum((x_pred3 * x_output3) * binary_mask) / torch.nonzero(binary_mask).size(0)
         x_output3.to('cpu')
 
-        return torch.stack([loss1, loss2, loss3])
+        return loss1, loss2, loss3
 
     def compute_miou(self, x_pred, x_output):
         x_output = x_output.to(self.device)
@@ -95,11 +95,14 @@ class MultiTaskModel(nn.Module):
         if not rmse:
             abs_err = torch.abs(x_pred_true - x_output_true)
         else:
-            abs_err = torch.sqrt((x_pred_true - x_output_true) ** 2)
+            abs_err = (x_pred_true - x_output_true) ** 2
         rel_err = abs_err / x_output_true
 
         _ = x_output.to('cpu')
-        return torch.sum(abs_err) / torch.nonzero(binary_mask).size(0), torch.sum(rel_err) / torch.nonzero(
+        abs_error = torch.sum(abs_err) / torch.nonzero(binary_mask).size(0)
+        if rmse:
+            abs_error = torch.sqrt(abs_error)
+        return abs_error, torch.sum(rel_err) / torch.nonzero(
             binary_mask).size(0)
 
     def normal_error(self, x_pred, x_output):

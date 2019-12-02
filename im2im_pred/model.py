@@ -2,6 +2,7 @@ import sys
 import platform
 import argparse
 import os
+from copy import copy
 
 from metrics import IntersectionOverUnion, PixelAccuracy, DepthErrors
 
@@ -25,6 +26,7 @@ parser.add_argument('--single_task_ind', default=-1, type=int,
                     help='Index which single task to run. -1 is multi-task.')
 parser.add_argument('--finetune_name_model_run', default='', type=str, help='Name model run to finetune.')
 parser.add_argument('--finetune_epochs', default=20, type=int, help='Epochs to finetune.')
+parser.add_argument('--retrain_head_name_model_run', default='', type=str, help='Name model run to finetune.')
 parser.add_argument('--not_log_gradients_metrics', default=False, type=bool,
                     help='Whether to log gradients based metrics and sums.')
 parser.add_argument('--not_log_optimizer_metrics', default=False, type=bool,
@@ -32,6 +34,7 @@ parser.add_argument('--not_log_optimizer_metrics', default=False, type=bool,
 parser.add_argument('--balance_pixel_cross_entropy_loss', default=True, type=bool,
                     help='Whether to balance pixel cross-entropy loss.')
 parser.add_argument('--seed_multiplier', default=1, type=int, help='Multiplier for seed (to get multiple experiments).')
+parser.add_argument('--training_subsampling', default=1.0, type=float, help='Subsamoling for checking robustness')
 
 opt = parser.parse_args()
 
@@ -83,35 +86,61 @@ from create_dataset import *
 from model_testing import evaluate_model, write_performance, load_model
 
 if not no_debug:
-    # opt.finetune_name_model_run = 'mtan_segnet_dwa_adam_run_copy_of_3_4'
+    # opt.model = 'segnet_without_attention'
+    # opt.retrain_head_name_model_run = 'mtan_segnet_without_attention_equal_adam_single_task_1_run_0_copy'
+    # opt.single_task_ind = 0
     opt.bsm = 1
     # opt.optimizer = 'multitask_adam_mixing_hd'
 
-finetuning = False
-if opt.finetune_name_model_run:
-    assert os.path.exists('./logs/{}'.format(opt.finetune_name_model_run)), \
-        'Name model run "{}" does not exist in "./logs/".'.format(opt.finetune_name_model_run)
 
-    with open('./logs/{}/cmd_parameters.txt'.format(opt.finetune_name_model_run), 'r') as f:
+finetuning = False
+retrain_head = False
+if opt.finetune_name_model_run or opt.retrain_head_name_model_run:
+    assert os.path.exists('./logs/{}'.format(opt.finetune_name_model_run or opt.retrain_head_name_model_run)), \
+        'Name model run "{}" does not exist in "./logs/".'.format(opt.finetune_name_model_run or opt.retrain_head_name_model_run)
+
+    with open('./logs/{}/cmd_parameters.txt'.format(opt.finetune_name_model_run or opt.retrain_head_name_model_run), 'r') as f:
         run_params = eval('argparse.' + f.readlines()[0])
 
     assert run_params.model == opt.model, 'Can only finetune the same model. Old: {}, New: {}'.format(run_params.model,
                                                                                                       opt.model)
-    # assert run_params.shrink == opt.shrink, 'Shrinkage has to be the same for same batch size. Old: {}, New: {}'.format(
-    #     run_params.shrink, opt.shrink)
-    #
-    # assert run_params.bsm == opt.bsm, \
-    #     'Batch size multiplier has to be the same for same batch size. Old: {}, New: {}'.format(run_params.bsm, opt.bsm)
 
-    assert not hasattr(run_params,
-                       'single_task_ind') or run_params.single_task_ind == -1, 'Can not finetune single task models.'
+    if opt.finetune_name_model_run:
+        finetuning = True
 
-    finetuning = True
+        assert not hasattr(run_params,
+                           'single_task_ind') or run_params.single_task_ind == -1, 'Can not finetune single task models.'
 
-    optim_str = str(opt.optimizer)
-    if 'hd' in opt.optimizer:
-        optim_str += '_npf' if opt.not_per_filter else ''
-    print('Finetuning run "{}" with optimizer "{}".'.format(opt.finetune_name_model_run, optim_str))
+        optim_str = str(opt.optimizer)
+        if 'hd' in opt.optimizer:
+            optim_str += '_npf' if opt.not_per_filter else ''
+        print('Finetuning run "{}" with optimizer "{}".'.format(opt.finetune_name_model_run, optim_str))
+
+    if opt.retrain_head_name_model_run:
+        retrain_head = True
+
+        assert not(run_params.single_task_ind == -1 and opt.single_task_ind != -1), \
+            'Should not retrain Multitask model on Single Task.'
+
+        assert not (run_params.single_task_ind == opt.single_task_ind and opt.single_task_ind != -1), \
+            'Should not retrain Single Task on same Single Task.'
+
+        assert not (opt.single_task_ind == -1 and opt.single_task_ind != -1), \
+            'Should not retrain Single Task on same Multitask.'
+
+        opt_c = copy(opt)
+        vars(opt).update(vars(run_params))
+        opt.seed_multiplier = opt_c.seed_multiplier
+        opt.single_task_ind = opt_c.single_task_ind
+        opt.retrain_head_name_model_run = opt_c.retrain_head_name_model_run
+        opt.not_log_gradients_metrics = opt_c.not_log_gradients_metrics
+        opt.not_log_optimizer_metrics = opt_c.not_log_optimizer_metrics
+
+        print('Finetuning run "{}" on task "{}".'.format(opt.retrain_head_name_model_run, opt.single_task_ind))
+
+    assert not finetuning or not retrain_head, 'Can not finetune and retrain simultaneously.'
+
+
 
 if opt.model not in available_architectures:
     print("Specified unknown model_name: {}. Changed to 'segnet''".format(opt.model))
@@ -129,7 +158,7 @@ def shrink_str(shrink):
         return ''
 
 
-name_model_run = 'mtan_{}_{}_{}_{}{}{}run_{}'
+name_model_run = 'mtan_{}_{}_{}_{}{}{}{}{}run_{}'
 if no_debug:
     model_str = str(opt.model)
 
@@ -138,7 +167,7 @@ if no_debug:
         assert 'adam' == opt.optimizer, 'Can only run single task with "segnet_without_attention".'
         assert 'equal' == opt.weight, 'Weighting of tasks should be "equal".'
 
-    log_every_nth = 2       # way more memory necessary for gradient logging
+    log_every_nth = 2 if not opt.not_log_gradients_metrics else 10
 
     optim_str = str(opt.optimizer)
     if 'hd' in opt.optimizer:
@@ -150,6 +179,9 @@ if no_debug:
                                                       format(model_str, opt.weight, optim_str, shrink_str(opt.shrink),
                                                              single_task_str,
                                                              'finetuning_' if finetuning else '',
+                                                             'retrain_head_' if retrain_head else '',
+                                                             'tr_subsampling_{}'.format(
+                                                                 opt.training_subsampling) if opt.training_subsampling < 1.0 else '',
                                                              '')))
     if len(old_run_dirs) > 0:
         run_number = sorted([int(old_run_dir.split('_')[-1]) for old_run_dir in old_run_dirs])[-1] + 1
@@ -158,6 +190,9 @@ if no_debug:
     name_model_run = name_model_run.format(model_str, opt.weight, optim_str, shrink_str(opt.shrink),
                                            single_task_str,
                                            'finetuning_' if finetuning else '',
+                                           'retrain_head_' if retrain_head else '',
+                                           'tr_subsampling_{}'.format(
+                                               opt.training_subsampling) if opt.training_subsampling < 1.0 else '',
                                            run_number)
 
     exist_ok = False
@@ -166,19 +201,19 @@ if no_debug:
 else:
     import shutil
 
-    if not finetuning:
-        opt.model = 'segnet_without_attention'
-        opt.optimizer = 'multitask_adam_linear_combination_hd'
+    if not finetuning and not retrain_head:
+        opt.model = 'segnet'
+        opt.optimizer = 'adam'
 
         # opt.single_task_ind = 2
         # opt.weight = 'equal'
 
         opt.not_per_filter = False
-        opt.weight = 'equal'
+        # opt.weight = 'gradnorm'
         # opt.shrink = 4
 
-    opt.not_log_gradients_metrics = True
-    opt.not_log_optimizer_metrics = True
+    # opt.not_log_gradients_metrics = True
+    # opt.not_log_optimizer_metrics = True
 
     opt.balance_pixel_cross_entropy_loss = True
     pixel_acc_mean_over_classes = opt.balance_pixel_cross_entropy_loss
@@ -206,6 +241,9 @@ else:
     name_model_run = name_model_run.format(model_str, opt.weight, optim_str, shrink_str(opt.shrink),
                                            single_task_str,
                                            'finetuning_' if finetuning else '',
+                                           'retrain_head_' if retrain_head else '',
+                                           'tr_subsampling_{}'.format(
+                                               opt.training_subsampling) if opt.training_subsampling < 1.0 else '',
                                            'debug')
     if os.path.exists('./logs/{}'.format(name_model_run)):
         shutil.rmtree('./logs/{}'.format(name_model_run))
@@ -256,16 +294,7 @@ if finetuning:
 else:
     model = arch(device)
 
-if opt.weight == 'gradnorm':
-    model.register_parameter('task_weights', torch.nn.Parameter(torch.ones(3, device=device)))
-    model.grad_norm_hook()
-    initial_task_loss = None
-
-if opt.weight not in ('equal', 'dwa', 'gradnorm'):
-    # weight uncertainty
-    model.register_parameter('logsigma', torch.nn.Parameter(torch.FloatTensor([-0.5, -0.5, -0.5], device=device)))
-
-if opt.single_task_ind >= 0:
+if opt.single_task_ind >= 0 or retrain_head:
     opt.not_log_gradients_metrics = True
     opt.not_log_optimizer_metrics = True
 
@@ -274,20 +303,39 @@ if opt.optimizer in ('multitask_adam_hd', 'multitask_adam_mixing_hd', 'multitask
     kwargs = {'per_filter': not opt.not_per_filter, 'logging': not opt.not_log_optimizer_metrics,
               'model': None if no_debug else model}
 
-optimizer = optimizer(model.parameters(), lr=1e-4*opt.shrink*math.sqrt(opt.bsm), **kwargs)
-# scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.5)
+if not retrain_head:
 
-if not opt.not_log_gradients_metrics:
+    if opt.weight == 'gradnorm':
+        model.register_parameter('task_weights', torch.nn.Parameter(torch.ones(3, device=device)))
+        model.grad_norm_hook()
+        initial_task_loss = None
+
+    if opt.weight not in ('equal', 'dwa', 'gradnorm'):
+        # weight uncertainty
+        model.register_parameter('logsigma', torch.nn.Parameter(torch.FloatTensor([-0.5, -0.5, -0.5], device=device)))
+
+    optimizer = optimizer(model.parameters(), lr=1e-4*opt.shrink*math.sqrt(opt.bsm), **kwargs)
+
     # add gradient logger hooks
-    model.gradient_logger_hooks('./logs/{}/gradient_logs/'.format(name_model_run))
+    model.gradient_logger_hooks('./logs/{}/gradient_logs/'.format(name_model_run),
+                                no_hooks=opt.not_log_gradients_metrics)
 
-# log task_weights only for the params which gradients are logged
-for group in optimizer.param_groups:
-    if group.get('logging'):
-        d = {}
-        for hooked in model.hooked_params_or_modules:
-            d[hooked] = True
-        group.setdefault('param_to_log_map', d)
+    # log task_weights only for the params which gradients are logged
+    for group in optimizer.param_groups:
+        if group.get('logging'):
+            d = {}
+            for hooked in model.hooked_params_or_modules:
+                d[hooked] = True
+            group.setdefault('param_to_log_map', d)
+
+else:
+    CHECKPOINT_PATH = Path('./logs/{}/model_checkpoints/checkpoint.chk'.format(opt.retrain_head_name_model_run))
+    model = load_model(CHECKPOINT_PATH, device)
+
+    model.reinitialize_output_heads_and_freeze_rest()
+
+    optimizer = optimizer(filter(lambda p: p.requires_grad, model.parameters()),
+                          lr=1e-4 * opt.shrink * math.sqrt(opt.bsm), **kwargs)
 
 
 # compute parameter space
@@ -319,8 +367,12 @@ if not no_debug:
 else:
     num_workers = 2
 
+    if opt.training_subsampling < 1.0:
+        shuffled = random.sample(list(range(len(nyuv2_train_set))), len(nyuv2_train_set))
+        nyuv2_train_set = Subset(nyuv2_train_set, shuffled[:int(len(nyuv2_train_set) * opt.training_subsampling)])
+
 if opt.balance_pixel_cross_entropy_loss:
-    if no_debug and os.path.exists(dataset_path+'/class_weights.pt'):
+    if no_debug and os.path.exists(dataset_path+'/class_weights.pt') and opt.training_subsampling == 1.0:
         class_weights = torch.load(dataset_path+'/class_weights.pt')
     else:
         counts = torch.zeros(model.class_nb)
@@ -331,7 +383,7 @@ if opt.balance_pixel_cross_entropy_loss:
                     counts[cl.long()] += scounts[ci]
         class_weights = counts.sum() / counts
         class_weights = model.class_nb * (class_weights / class_weights.sum())
-        if no_debug:
+        if no_debug and opt.training_subsampling == 1.0:
             torch.save(class_weights, dataset_path + '/class_weights.pt')
 else:
     class_weights = torch.ones(model.class_nb)
@@ -352,7 +404,9 @@ nyuv2_test_loader = torch.utils.data.DataLoader(
 print('Train {} model with {} optimizer and {} weighting.'.format(type(model), type(optimizer), opt.weight))
 
 # define parameters
-total_epoch = 100 if not finetuning else opt.finetune_epochs    # he trained for 200
+total_epoch = 100 if not finetuning and not retrain_head else opt.finetune_epochs
+if opt.training_subsampling < 1.0:
+    total_epoch = int(100 * opt.training_subsampling)
 T = opt.temp
 avg_cost = np.zeros([total_epoch, 24], dtype=np.float32)
 test_avg_cost = np.zeros(12, dtype=np.float32)
@@ -363,6 +417,9 @@ performance = ''
 for epoch in range(total_epoch):
     model.train()
     start_time_epoch = datetime.now()
+
+    if retrain_head:
+        model.deactivate_freezed_batch_norm_layers()
 
     index = epoch
     cost = np.zeros(24, dtype=np.float32)
@@ -553,10 +610,14 @@ for epoch in range(total_epoch):
         optimizer.update_optimizer_data_logs(model.named_parameters(), index)
 
     if index % log_every_nth == 0 or index == total_epoch-1:
+        index_str = '_epoch' + str(index)
+        if index == total_epoch-1:
+            index_str = ''
+
         CHECKPOINT_PATH = Path('./logs/{}/model_checkpoints/'.format(name_model_run))
         os.makedirs(CHECKPOINT_PATH, exist_ok=True)
 
-        checkpoint_name = 'checkpoint.chk'
+        checkpoint_name = 'checkpoint{}.chk'.format(index_str)
         torch.save({
             'architecture': type(model).__name__,
             'epoch': index,

@@ -165,6 +165,54 @@ class MultiTaskModel(nn.Module):
     def last_shared_layer(self):
         pass
 
+    def reinitialize_output_heads_and_freeze_rest(self):
+        pred_task_params = []
+        for m in self.pred_task.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.xavier_normal_(m.weight)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                nn.init.constant_(m.bias, 0)
+            else:
+                continue
+            pred_task_params.append(m.weight)
+            pred_task_params.append(m.bias)
+        for param in self.parameters():
+            if not any([param is pred_task_param for pred_task_param in pred_task_params]):
+                param.requires_grad = False
+
+    def deactivate_freezed_batch_norm_layers(self):
+        def eval_all_bn(module):
+            if len(list(module.children())) == 0:
+                if not isinstance(module, nn.BatchNorm2d):
+                    raise ValueError('Eval not on BN layer.')
+                else:
+                    module.eval()
+                    return
+            for layer in list(module.children()):
+                if isinstance(layer,
+                              nn.Sequential):  # if sequential layer, apply recursively to layers in sequential layer
+                    try:
+                        eval_all_bn(layer)
+                    except:  # may not contain a BN layer
+                        pass
+                if isinstance(layer, nn.BatchNorm2d):  # if leaf node, add it to list
+                    layer.eval()
+                try:
+                    eval_all_bn(layer)
+                except:
+                    pass
+            return
+
+        eval_all_bn(self)
+
+    def modules_forward_hook_activity(self, block_n=None):
+        pass
+
 
 class SegNetWithoutAttention(MultiTaskModel):
     def __init__(self, device, grad_hook_at_axon=False):
@@ -263,7 +311,7 @@ class SegNetWithoutAttention(MultiTaskModel):
 
         return [t1_pred, t2_pred, t3_pred]
 
-    def gradient_logger_hooks(self, grad_save_path):
+    def gradient_logger_hooks(self, grad_save_path, no_hooks=False):
 
         self.grad_save_path = grad_save_path
         self.gradient_loggers = []
@@ -282,24 +330,48 @@ class SegNetWithoutAttention(MultiTaskModel):
                                                                        name(i, None),
                                                                        self.grad_save_path, self.gradient_loggers)
                     else:
-                        self.hooked_params_or_modules += create_last_conv_hook_at(layer, self.n_tasks, name(i, None),
-                                                                                  self.grad_save_path,
-                                                                                  self.gradient_loggers)
+                        hooked_param_list, handle_weight, handle_bias = create_last_conv_hook_at(layer, self.n_tasks,
+                                                                                                 name(i, None),
+                                                                                                 self.grad_save_path,
+                                                                                                 self.gradient_loggers)
+                        self.hooked_params_or_modules += hooked_param_list
+                        if no_hooks:
+                            handle_weight.remove()
+                            handle_bias.remove()
                     i += 1
 
         gradient_logger_hooks_encoder_decoder(self.encoder, 'encoder')
         gradient_logger_hooks_encoder_decoder(self.decoder, 'decoder')
 
     def last_shared_layer(self):
-        return last_conv(self.decoder)
+        return self.decoder[-1].layers[-1]
 
     def grad_norm_hook(self):
         self.grad_norms_last_shared_layer = []
 
         def append_grad_norm(module, grad_input, grad_output):
-            self.grad_norms_last_shared_layer.append(grad_input[1].norm())
+            self.grad_norms_last_shared_layer.append(grad_input[0].norm())
 
         self.last_shared_layer().register_backward_hook(append_grad_norm)
+
+    def modules_forward_hook_activity(self, block_n=None):
+        assert block_n is not None, 'Do not call this method with None.'
+
+        mods = [
+            # encoder
+            self.encoder[1].layers[0],
+            self.encoder[2].layers[0],
+            self.encoder[3].layers[0],
+            self.encoder[4].layers[0],
+            self.encoder[5],
+
+            # decoder
+            self.decoder[0],
+            self.decoder[1],
+            self.decoder[2],
+            self.decoder[3],
+        ]
+        return mods[block_n]
 
 
 class SegNet(MultiTaskModel):
@@ -410,7 +482,7 @@ class SegNet(MultiTaskModel):
 
         return [t1_pred, t2_pred, t3_pred]
 
-    def gradient_logger_hooks(self, grad_save_path):
+    def gradient_logger_hooks(self, grad_save_path, no_hooks=False):
 
         self.grad_save_path = grad_save_path
         self.gradient_loggers = []
@@ -419,10 +491,9 @@ class SegNet(MultiTaskModel):
         def gradient_logger_hooks_encoder_decoder(enc_dec, block_name):
 
             def name(i, ind):
-                if self.grad_hook_at_axon:
-                    return '{}_block_{}'.format(block_name, i)
-                else:
-                    return '{}_block_{}_conv_{}'.format(block_name, i, ind)
+                assert self.grad_hook_at_axon or ind == 0
+                return '{}_block_{}'.format(block_name, i)
+
 
             i = 0
             for layer in enc_dec:
@@ -438,17 +509,43 @@ class SegNet(MultiTaskModel):
                                 conv_ind_ = conv_ind + 1
                             else:
                                 conv_ind_ = conv_ind
-                            self.hooked_params_or_modules += create_last_conv_hook_at(
+                            if conv_ind > 0: # gradients from attention modules arrive after first conv
+                                continue
+                            hooked_param_list, handle_weight, handle_bias = create_last_conv_hook_at(
                                 layer.attented_layer.layers[conv_ind_], self.n_tasks,
                                 name(i, conv_ind),
                                 self.grad_save_path, self.gradient_loggers)
+                            self.hooked_params_or_modules += hooked_param_list
+                            if no_hooks:
+                                handle_weight.remove()
+                                handle_bias.remove()
                     i += 1
 
         gradient_logger_hooks_encoder_decoder(self.encoder, 'encoder')
         gradient_logger_hooks_encoder_decoder(self.decoder, 'decoder')
 
     def last_shared_layer(self):
-        return last_conv(self.decoder)
+        return (self.decoder[-1].attented_layer.layers[-1], self.pred_task[0], self.pred_task[1], self.pred_task[2])
+
+    def modules_forward_hook_activity(self, block_n=None):
+        assert block_n is not None, 'Do not call this method with None.'
+
+        mods = [
+            # encoder
+            (self.encoder[1].attented_layer.layers[0], self.encoder[0]),
+            (self.encoder[2].attented_layer.layers[0], self.encoder[1]),
+            (self.encoder[3].attented_layer.layers[0], self.encoder[2]),
+            (self.encoder[4].attented_layer.layers[0], self.encoder[3]),
+            (self.encoder[5], self.encoder[4]),
+
+
+            # decoder
+            (self.decoder[0].attented_layer, self.decoder[0]),
+            (self.decoder[1].attented_layer, self.decoder[1]),
+            (self.decoder[2].attented_layer, self.decoder[2]),
+            (self.decoder[3].attented_layer, self.decoder[3]),
+        ]
+        return mods[block_n]
 
 
 # UNMAINTAINED

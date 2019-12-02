@@ -16,17 +16,39 @@ def css_whole_abs_gradient(grad1, grad2):
     return css_whole_gradient(grad1.abs(), grad2.abs())
 
 
-def css_separate_filter(grad1, grad2):
+def norm_per_filter(grad1):
+    dim = 0
+    if len(grad1.size()) != 1:
+        grad1 = grad1.flatten(start_dim=1, end_dim=-1)
+        dim = 1
+    return grad1.norm(dim=dim).numpy()
+
+
+def css_separate_filter_per_filter(grad1, grad2):
     dim = 0
     if len(grad1.size()) != 1 and len(grad2.size()) != 1:
         grad1 = grad1.flatten(start_dim=1, end_dim=-1)
         grad2 = grad2.flatten(start_dim=1, end_dim=-1)
         dim = 1
-    return F.cosine_similarity(grad1, grad2, dim=dim).mean().item()
+    return F.cosine_similarity(grad1, grad2, dim=dim).numpy()
+
+
+def css_separate_filter(grad1, grad2):
+    return css_separate_filter_per_filter(grad1, grad2).mean()
+
+
+def css_separate_filter_abs_gradient_per_filter(grad1, grad2):
+    # conv weight: # out channels * (in channels x 3 x 3)
+    dim = 0
+    if len(grad1.size()) != 1 and len(grad2.size()) != 1:
+        grad1 = grad1.abs().flatten(start_dim=1, end_dim=-1)
+        grad2 = grad2.abs().flatten(start_dim=1, end_dim=-1)
+        dim = 1
+    return F.cosine_similarity(grad1, grad2, dim=dim).numpy()
 
 
 def css_separate_filter_abs_gradient(grad1, grad2):
-    return css_separate_filter(grad1.abs(), grad2.abs())
+    return css_separate_filter_abs_gradient_per_filter(grad1, grad2).mean()
 
 
 def euclidean_distance(grad1, grad2):
@@ -76,16 +98,20 @@ class GradientLogger:
         self.grad_metrics_save = {}
 
         self.similarity_metrics = [
-            ('cosine_similarity_grad_{}_task{}_task{}', css_whole_gradient),
-            ('cosine_similarity_abs_grad_{}_task{}_task{}', css_whole_abs_gradient),
-            ('cosine_similarity_separate_filter_grad_{}_task{}_task{}', css_separate_filter),
-            ('cosine_similarity_separate_filter_abs_grad_{}_task{}_task{}', css_separate_filter_abs_gradient),
-            ('euclidean_distance_grad_{}_task{}_task{}', euclidean_distance),
-            ('chebyshev_distance_grad_{}_task{}_task{}', chebyshev_distance),
-            ('manhattan_distance_grad_{}_task{}_task{}', manhattan_distance),
-            ('jaccard_similarity_grad_{}_task{}_task{}', jaccard_similarity),
-            ('simpson_similarity_grad_{}_task{}_task{}', simpson_similarity),
-            ('intersection_distance_grad_{}_task{}_task{}', intersection_distance),
+            # ('cosine_similarity_grad_{}_task{}_task{}', css_whole_gradient),
+            # ('cosine_similarity_abs_grad_{}_task{}_task{}', css_whole_abs_gradient),
+            # ('cosine_similarity_separate_filter_grad_{}_task{}_task{}', css_separate_filter),
+            # ('cosine_similarity_separate_filter_abs_grad_{}_task{}_task{}', css_separate_filter_abs_gradient),
+            ('cosine_similarity_separate_filter_grad_{}_task{}_task{}_per_filter',
+             css_separate_filter_per_filter),
+            # ('cosine_similarity_separate_filter_abs_grad_{}_task{}_task{}_per_filter',
+            #  css_separate_filter_abs_gradient_per_filter),
+            # ('euclidean_distance_grad_{}_task{}_task{}', euclidean_distance),
+            # ('chebyshev_distance_grad_{}_task{}_task{}', chebyshev_distance),
+            # ('manhattan_distance_grad_{}_task{}_task{}', manhattan_distance),
+            # ('jaccard_similarity_grad_{}_task{}_task{}', jaccard_similarity),
+            # ('simpson_similarity_grad_{}_task{}_task{}', simpson_similarity),
+            # ('intersection_distance_grad_{}_task{}_task{}', intersection_distance),
         ]
 
         self.use_incremental_pca = use_incremental_pca
@@ -102,6 +128,7 @@ class GradientLogger:
         for name in ['weights', 'biases']:
             for task_ind in range(self.n_tasks):
                 self.grad_metrics['norm_grad_{}_task{}'.format(name, task_ind + 1)] = []
+                self.grad_metrics['norm_grad_{}_task{}_per_filter'.format(name, task_ind + 1)] = []
                 for task_ind_other in range(task_ind + 1, self.n_tasks):
                     for similarity_metric, _ in self.similarity_metrics:
                         self.grad_metrics[
@@ -161,6 +188,8 @@ class GradientLogger:
                 for task_ind in range(len(grad_list)):
                     self.grad_metrics['norm_grad_{}_task{}'.format(param_kind, task_ind + 1)].append(
                         grad_list[task_ind].flatten().norm().item())
+                    self.grad_metrics['norm_grad_{}_task{}_per_filter'.format(param_kind, task_ind + 1)].append(
+                        norm_per_filter(grad_list[task_ind]))
                     for task_ind_other in range(task_ind + 1, self.n_tasks):
                         for similarity_metric, similarity_func in self.similarity_metrics:
                             self.grad_metrics[similarity_metric.format(param_kind, task_ind + 1,
@@ -253,13 +282,13 @@ def add_grad_hook_conv_params(module, n_tasks, name, grad_save_path, gradient_lo
 
     grad_logger = append_and_return(gradient_loggers, GradientLogger(n_tasks, name, grad_save_path))
 
-    module.weight.register_hook(
+    handle_weight = module.weight.register_hook(
         grad_logger.update_grad_list_param_weights)
 
-    module.bias.register_hook(
+    handle_bias = module.bias.register_hook(
         grad_logger.update_grad_list_param_biases)
 
-    return [module.weight, module.bias]
+    return [module.weight, module.bias], handle_weight, handle_bias
 
 
 def add_grad_hook(module, n_tasks, name, grad_save_path, gradient_loggers):

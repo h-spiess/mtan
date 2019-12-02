@@ -312,6 +312,12 @@ class MultitaskAdam(MultitaskOptimizer):
                                                                                     multiplicative_rule_normalization)
 
                             state['lr'][i] *= (1 - multiplicative_update)
+
+                            # prevent it from getting zero -> if it does then no more change possible
+                            if isinstance(state['lr'][i], float):
+                                state['lr'][i] = max(state['lr'][i], group['eps'])
+                            else:
+                                state['lr'][i] = torch.max(state['lr'][i], torch.full_like(state['lr'][i], group['eps']))
                         step_size = state['lr'][i]
 
                     # Decay the first and second moment running average coefficient
@@ -593,6 +599,13 @@ class MultitaskAdamMixingHD(MultitaskOptimizer):
                                                                                     multiplicative_rule_normalization)
 
                             state['mixing_factors'][i] *= (1 - multiplicative_update)
+
+                            # prevent it from getting zero -> if it does then no more change possible
+                            if isinstance(state['mixing_factors'][i], float):
+                                state['mixing_factors'][i] = max(state['mixing_factors'][i], group['eps'])
+                            else:
+                                state['mixing_factors'][i] = torch.max(state['mixing_factors'][i],
+                                                                       torch.full_like(state['mixing_factors'][i], group['eps']))
 
                 if not test_grad_exit and group['normalize_and_clamp_mixing_weights']:
                     sum_mixing_weights = 0

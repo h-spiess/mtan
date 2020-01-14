@@ -7,7 +7,7 @@ from copy import copy
 from metrics import IntersectionOverUnion, PixelAccuracy, DepthErrors
 
 available_architectures = ('resnet', 'segnet_without_attention', 'segnet')
-available_optimizers = ('adam', 'multitask_adam', 'multitask_adam_hd', 'multitask_adam_mixing_hd',
+available_optimizers = ('adam', 'multitask_adam', 'multitask_adam_hd', 'multitask_adam_decoupled_hd', 'multitask_adam_mixing_hd',
                         'multitask_adam_linear_combination_hd')
 
 parser = argparse.ArgumentParser(description='Multi-task: Attention Network')
@@ -59,7 +59,7 @@ else:
     gpu = opt.gpu
 
 if not no_debug:
-    gpu = 1
+    gpu = 0
 
 # define model, optimiser and scheduler
 os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu)
@@ -81,7 +81,7 @@ from torch.utils.data import RandomSampler, Subset
 
 from architectures import SegNet, ResNetUnet, SegNetWithoutAttention
 from multitask_optimizers import MultitaskAdam, MultitaskAdamHD, MultitaskOptimizer, MultitaskAdamMixingHD, \
-    MultitaskAdamLinearCombinationHD
+    MultitaskAdamLinearCombinationHD, MultitaskAdamDecoupledHD
 from create_dataset import *
 from model_testing import evaluate_model, write_performance, load_model
 
@@ -203,7 +203,7 @@ else:
 
     if not finetuning and not retrain_head:
         opt.model = 'segnet'
-        opt.optimizer = 'adam'
+        opt.optimizer = 'multitask_adam_decoupled_hd'
 
         # opt.single_task_ind = 2
         # opt.weight = 'equal'
@@ -271,7 +271,8 @@ else:
 
 optimizer_map = {'adam': optim.Adam, 'multitask_adam': MultitaskAdam,
                  'multitask_adam_hd': MultitaskAdamHD, 'multitask_adam_mixing_hd': MultitaskAdamMixingHD,
-                 'multitask_adam_linear_combination_hd': MultitaskAdamLinearCombinationHD}
+                 'multitask_adam_linear_combination_hd': MultitaskAdamLinearCombinationHD,
+                 'multitask_adam_decoupled_hd': MultitaskAdamDecoupledHD}
 optimizer = optimizer_map.get(opt.optimizer, optim.Adam)
 
 device = torch.device("cuda:{}".format(gpu) if torch.cuda.is_available() else "cpu")

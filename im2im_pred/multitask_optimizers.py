@@ -5,6 +5,7 @@ from functools import partial
 from pathlib import Path
 
 import torch
+from torch import sigmoid
 from torch.optim import Optimizer
 import numpy as np
 
@@ -151,7 +152,7 @@ class MultitaskAdam(MultitaskOptimizer):
 
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8,
                  weight_decay=0, amsgrad=False, hypergrad_lr=None, multiplicative_rule=True, per_filter=True,
-                 logging=True, model=None):
+                 logging=True, decoupled=False, model=None):
         if not 0.0 <= lr:
             raise ValueError("Invalid learning rate: {}".format(lr))
         if not 0.0 <= eps:
@@ -176,6 +177,9 @@ class MultitaskAdam(MultitaskOptimizer):
             optimizer_logs_counts = {}
             optimizer_logs_save = {}
         else:
+            assert not decoupled, "Decoupled parameter only for hypergradient-based method."
+            assert not decoupled and not multiplicative_rule, 'Multiplicative rule is not working with decoupled probably.'
+
             logging = False
             parameter_name_map = None
             optimizer_logs = None
@@ -187,6 +191,7 @@ class MultitaskAdam(MultitaskOptimizer):
                         multiplicative_rule=multiplicative_rule,
                         per_filter=per_filter,
                         logging=logging, parameter_name_map=parameter_name_map,
+                        decoupled=decoupled,
                         optimizer_logs=optimizer_logs, optimizer_logs_counts=optimizer_logs_counts,
                         optimizer_logs_save=optimizer_logs_save)
         super().__init__(params, defaults)
@@ -217,6 +222,7 @@ class MultitaskAdam(MultitaskOptimizer):
                 amsgrad = group['amsgrad']
                 hypergrad_lr = group['hypergrad_lr']
                 multiplicative_rule = group['multiplicative_rule']
+                decoupled = group['decoupled']
 
                 state = self.state[p]
                 n_tasks = len(task_grads)
@@ -235,14 +241,16 @@ class MultitaskAdam(MultitaskOptimizer):
                         state['max_exp_avg_sq'] = [torch.zeros_like(p.data) for _ in range(n_tasks)]
 
                     if hypergrad_lr:
+                        initial_value = group['lr'] if not decoupled else 1.
+
                         # per parameter learning rate
                         if not group['per_filter']:
-                            state['lr'] = [group['lr']] * n_tasks
+                            state['lr'] = [initial_value] * n_tasks
                         elif len(p.data.size()) == 1:
-                            state['lr'] = [torch.full(p.data.size(), group['lr']).to(p.data.device)
+                            state['lr'] = [torch.full(p.data.size(), initial_value).to(p.data.device)
                                            for _ in range(n_tasks)]
                         elif len(p.data.size()) == 4:
-                            state['lr'] = [torch.full(p.data.size()[0:1], group['lr']).to(p.data.device)
+                            state['lr'] = [torch.full(p.data.size()[0:1], initial_value).to(p.data.device)
                                            for _ in range(n_tasks)]
                         else:
                             raise ValueError("Param has not 4 (conv) or 1 (bias) dimension. Size: ", p.data.size())
@@ -274,6 +282,10 @@ class MultitaskAdam(MultitaskOptimizer):
                         if not group['per_filter']:
                             grad_h = -torch.div(exp_avg, exp_avg_sq.sqrt().add_(group['eps'])).mul_(
                                 *math.sqrt(prev_bias_correction2) / prev_bias_correction1)
+
+                            if decoupled:
+                                grad_h *= sigmoid(state['lr'][i]) * (1 - sigmoid(state['lr'][i]))
+
                             h = torch.dot(task_grad.view(-1), grad_h.view(-1))
 
                             if multiplicative_rule:
@@ -282,6 +294,10 @@ class MultitaskAdam(MultitaskOptimizer):
                         elif len(task_grad.size()) == 1:
                             grad_h = -torch.div(exp_avg, exp_avg_sq.sqrt().add_(group['eps'])).mul_(
                                 math.sqrt(prev_bias_correction2) / prev_bias_correction1)
+
+                            if decoupled:
+                                grad_h *= sigmoid(state['lr'][i]) * (1 - sigmoid(state['lr'][i]))
+
                             h = task_grad * grad_h
 
                             if multiplicative_rule:
@@ -294,6 +310,11 @@ class MultitaskAdam(MultitaskOptimizer):
                             # which is the same as element-wise
                             grad_h = -torch.div(exp_avg, exp_avg_sq.sqrt().add_(group['eps'])).mul_(
                                 math.sqrt(prev_bias_correction2) / prev_bias_correction1)
+
+                            if decoupled:
+                                sigm = sigmoid(state['lr'][i])[..., None, None, None]
+                                grad_h *= sigm * (1 - sigm)
+
                             h = (task_grad * grad_h).sum(dim=(1, 2, 3))
 
                             # TODO
@@ -318,7 +339,8 @@ class MultitaskAdam(MultitaskOptimizer):
                                 state['lr'][i] = max(state['lr'][i], group['eps'])
                             else:
                                 state['lr'][i] = torch.max(state['lr'][i], torch.full_like(state['lr'][i], group['eps']))
-                        step_size = state['lr'][i]
+
+                        step_size = state['lr'][i] if not decoupled else group['lr'] * sigmoid(state['lr'][i])
 
                     # Decay the first and second moment running average coefficient
                     exp_avg.mul_(beta1).add_(1 - beta1, task_grad)
@@ -377,6 +399,34 @@ class MultitaskAdamHD(MultitaskAdam):
                                               amsgrad=False, hypergrad_lr=hypergrad_lr,
                                               multiplicative_rule=multiplicative_rule, per_filter=per_filter,
                                               logging=logging, model=model)
+
+
+class MultitaskAdamDecoupledHD(MultitaskAdam):
+    """Implements Adam algorithm.
+    It has been proposed in `Adam: A Method for Stochastic Optimization`_.
+    Arguments:
+        params (iterable): iterable of parameters to optimize or dicts defining
+            parameter groups
+        lr (float, optional): learning rate (default: 1e-3)
+        betas (Tuple[float, float], optional): coefficients used for computing
+            running averages of gradient and its square (default: (0.9, 0.999))
+        eps (float, optional): term added to the denominator to improve
+            numerical stability (default: 1e-8)
+        weight_decay (float, optional): weight decay (L2 penalty) (default: 0)
+        hypergrad_lr (float, optional): hypergradient learning rate for the online
+        tuning of the learning rate, introduced in the paper
+        `Online Learning Rate Adaptation with Hypergradient Descent`_
+    .. _Adam\: A Method for Stochastic Optimization:
+        https://arxiv.org/abs/1412.6980
+    .. _Online Learning Rate Adaptation with Hypergradient Descent:
+        https://openreview.net/forum?id=BkrsAzWAb
+    """
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8,
+                 weight_decay=0, hypergrad_lr=1e-2, multiplicative_rule=False, per_filter=True, logging=True, model=None):
+        super(MultitaskAdamDecoupledHD, self).__init__(params, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
+                                                       amsgrad=False, hypergrad_lr=hypergrad_lr,
+                                                       multiplicative_rule=multiplicative_rule, per_filter=per_filter,
+                                                       logging=logging, decoupled=True, model=model)
 
 
 class MultitaskAdamMixingHD(MultitaskOptimizer):

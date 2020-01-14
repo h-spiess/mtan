@@ -8,8 +8,12 @@ import matplotlib
 from matplotlib.lines import Line2D
 from matplotlib.ticker import FormatStrFormatter
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+from scipy.spatial.distance import pdist, squareform
 from sklearn.manifold import TSNE, SpectralEmbedding
+from umap import UMAP
 from torch.utils.data import Subset
+
+import myAggClustering
 
 os.environ['PATH'] = '/home/spiess/anaconda3/envs/thesis/bin:/home/spiess/anaconda3/condabin:' + os.environ['PATH']
 import shutil
@@ -168,7 +172,7 @@ def pixelAccuracy(imPred, imLab, missing=-1):
     return (pixel_accuracy, pixel_correct, pixel_labeled)
 
 
-def evaluate_model_input_dissimilarity(model, test_loader, device, block_n=None):
+def evaluate_model_input_dissimilarity(model, test_loader, device, block_n=None, intrinsic_dimension=False):
     model.eval()
 
     if block_n is None:
@@ -222,8 +226,11 @@ def evaluate_model_input_dissimilarity(model, test_loader, device, block_n=None)
                 activations = np.array(l)
                 del l[:]
                 activations = activations.reshape(activations.shape[0], -1)
-                res = correlation_matrix(activations, SPLITROWS=100)
-                res = 1 - res  # dissimilarity
+                if not intrinsic_dimension:
+                    res = correlation_matrix(activations, SPLITROWS=100)
+                    res = 1 - res  # dissimilarity
+                else:
+                    res = squareform(pdist(activations))
                 ress.append(res)
 
             handle.remove()
@@ -784,12 +791,16 @@ def plot_artificial_css(artificial_css, blocks, one_head, loss_vs_names):
 
 
 def evaluate_saved_model(CHECKPOINT_PATH, device, ModelClass=None, test=False, input_dissimilarity=False,
+                         intrinsic_dimension=False,
                          plot_sample=False, block_n=None, **kwargs):
     dataset_path = 'data/nyuv2'
     #TODO change to train=False again
     nyuv2_test_set = NYUv2(root=dataset_path, train=False)
 
-    batch_size = 1 if input_dissimilarity else 2
+    assert not input_dissimilarity or not intrinsic_dimension, "Can not compute input dissimilarity " \
+                                                               "and intrinsic dimension at the same time."
+
+    batch_size = 1 if input_dissimilarity or intrinsic_dimension else 2
     num_workers = 2
 
     nyuv2_test_loader = torch.utils.data.DataLoader(
@@ -804,6 +815,9 @@ def evaluate_saved_model(CHECKPOINT_PATH, device, ModelClass=None, test=False, i
     model = load_model(CHECKPOINT_PATH, device, ModelClass=ModelClass, **kwargs)
     if input_dissimilarity:
         return evaluate_model_input_dissimilarity(model, nyuv2_test_loader, device, block_n=block_n)
+    elif intrinsic_dimension:
+        return evaluate_model_input_dissimilarity(model, nyuv2_test_loader, device, block_n=block_n, 
+                                                  intrinsic_dimension=True)
     else:
         return evaluate_model(model, nyuv2_test_loader, device, -1, test_avg_cost, test_cost, test=test,
                               plot_sample=plot_sample)
@@ -824,13 +838,15 @@ def write_performance(name_model_run, performance, loss_str):
         handle.write(performance)
 
 
-def write_input_dissimilarity(name_model_run, input_dissimilarity, att_block_n=None, block_n=None, epoch_n=None):
+def write_input_dissimilarity(name_model_run, input_dissimilarity, att_block_n=None, block_n=None, epoch_n=None,
+                              intrinsic_dimension=False):
     epoch_str = '_epoch_{}'.format(epoch_n) if epoch_n is not None else ''
     block_str = '_block_{}'.format(block_n) if block_n is not None else ''
     att_block_str = '_att_block_{}'.format(att_block_n) if att_block_n else ''
     SAVE_PATH = Path('./logs/{}/'.format(name_model_run))
     os.makedirs(SAVE_PATH, exist_ok=True)
-    np.save(SAVE_PATH / 'input_dissimilarity{}{}{}.npy'.format(block_str, att_block_str, epoch_str), input_dissimilarity)
+    name = 'input_dissimilarity' if not intrinsic_dimension else 'activation_distances'
+    np.save(SAVE_PATH / '{}{}{}{}.npy'.format(name, block_str, att_block_str, epoch_str), input_dissimilarity)
 
 
 def plot_input_dissimilarity_from_file(path):
@@ -1231,29 +1247,35 @@ def correlation_matrix_of_rdms_from_names(model_names, reduce=False, all_blocks=
     return correlation_matrix_of_rdms(rdms_from_names(model_names, reduce=reduce, all_blocks=all_blocks, over_time=over_time))
 
 
-def rdms_from_names(model_names, reduce=True, all_blocks=False, over_time=False):
+def intrinsic_dimension_from_names(model_names, reduce=False, all_blocks=False, over_time=False):
+    return rdms_from_names(model_names, reduce=reduce, all_blocks=all_blocks, over_time=over_time,
+                           intrinsic_dimension=True)
+
+
+def rdms_from_names(model_names, reduce=True, all_blocks=False, over_time=False, intrinsic_dimension=False):
     if all_blocks:
         inputs = ['_block_{}'.format(i) for i in range(0, 9)] + ['']
     else:
         inputs = ['']
 
-    # TODO over time
     if over_time:
         times = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, -1]
         inputs = [i + '_epoch_{}'.format(t) if t != -1 else i for (i, t) in itertools.product(inputs, times)]
 
+    representation_type = 'input_dissimilarity' if not intrinsic_dimension else 'activation_distances'
+
     if isinstance(model_names[0], str):
-        paths = [Path('./logs/{}/input_dissimilarity{}.npy'.format(name_model_run, block)) for (name_model_run, block)
+        paths = [Path('./logs/{}/{}{}.npy'.format(name_model_run, representation_type, block)) for (name_model_run, block)
                  in itertools.product(model_names, inputs)]
-        return rdms_from_paths(paths, over_time=over_time)
+        return rdms_from_paths(paths, intrinsic_dimension=intrinsic_dimension)
     elif isinstance(model_names[0], list):
         rdms = []
         for model_name_list in model_names:
             for block in inputs:
-                paths = [Path('./logs/{}/input_dissimilarity{}.npy'.format(name_model_run, block))
+                paths = [Path('./logs/{}/{}{}.npy'.format(name_model_run, representation_type, block))
                          for name_model_run in model_name_list]
                 # TODO pay attention to dimensions
-                rdms_model = rdms_from_paths(paths, over_time=over_time)
+                rdms_model = rdms_from_paths(paths, intrinsic_dimension=intrinsic_dimension)
 
                 if reduce:
                     if 'without' in model_name_list[0]:
@@ -1288,7 +1310,10 @@ def rdms_from_names(model_names, reduce=True, all_blocks=False, over_time=False)
         raise ValueError()
 
 
-def rdms_from_paths(paths_, over_time=False):
+def rdms_from_paths(paths_, intrinsic_dimension=False):
+    representation_type = 'input_dissimilarity' if not intrinsic_dimension else 'activation_distances'
+
+
     rdms = []
     for p in paths_:
         if os.path.exists(p):
@@ -1299,80 +1324,40 @@ def rdms_from_paths(paths_, over_time=False):
                 # case input_dissimilarity_block_xx_epoch_xx.npy
                 if 'block' in str(p) and 'epoch' in str(p):
                     ep = sp[sp.find('_epoch'):]
-                    bn = sp[sp.find('_block'):sp.find('_epoch')]
+                    bn = representation_type[-4:] + sp[sp.find('_block'):sp.find('_epoch')]
                     sp = sp.rstrip(ep)
 
                     paths = glob.glob(sp + '*')  # grab all input rdms of a specific model
                     paths = [p for p in paths if ep in p and bn in p]
-                    paths.sort(key= lambda x: x.rstrip(ep+'.npy'))  # ignore the epoch, otherwise alphabetical ordering
-                    print("")
+                    paths.sort(key=lambda x: x.rstrip(ep+'.npy'))  # ignore the epoch, otherwise alphabetical ordering
+                    if len(paths) != 4:
+                        print("")
                 # case input_dissimilarity_block_xx.npy
-                elif 'block' in str(p):
-                    bn = sp[sp.find('_block'):]
+                elif 'block' in str(p) and 'epoch' not in str(p):
+                    bn = representation_type[-4:] + sp[sp.find('_block'):]
 
                     paths = glob.glob(sp + '*')  # grab all input rdms of a specific model
                     paths = [p for p in paths if 'epoch' not in p and bn in p]
                     paths.sort()  # ignore the epoch, otherwise alphabetical ordering
-                    print("")
+                    if len(paths) != 4:
+                        print("")
                 # case input_dissimilarity_epoch_xx.npy
                 elif 'block' not in str(p) and 'epoch' in str(p):
                     ep = sp[sp.find('_epoch'):]
                     sp = sp.rstrip(ep)
 
                     paths = glob.glob(sp + '*')  # grab all input rdms of a specific model
-                    paths = [p for p in paths if ep in p and 'rity_block' not in p]
-                    paths.sort(key= lambda x: x.rstrip(ep+'.npy'))  # ignore the epoch, otherwise alphabetical ordering
-                    print("")
+                    paths = [p for p in paths if ep in p and representation_type[-4:]+'_block' not in p]
+                    paths.sort(key=lambda x: x.rstrip(ep+'.npy'))  # ignore the epoch, otherwise alphabetical ordering
+                    if len(paths) != 4:
+                        print("")
                 # case input_dissimilarity.npy
                 else:
                     paths = glob.glob(sp + '*')  # grab all input rdms of a specific model
-                    paths = [p for p in paths if 'epoch' not in p and 'rity_block' not in p]
+                    paths = [p for p in paths if 'epoch' not in p and representation_type[-4:]+'_block' not in p]
                     paths.sort()  # ignore the epoch, otherwise alphabetical ordering
-                    print("")
-
-
-
-                continue
-                return None
-
-                # TODO: problem, epoch is at the end, therefore glob does not get the attention blocks
-                if 'input_dissimilarity_epoch' in str(p):
-                    sp = str(p.with_suffix(''))
-                    ep = sp[sp.find('_epoch'):]
-                    sp = sp.rstrip(ep)
-
-                    paths = glob.glob(sp+'*') # grab all input rdms of a specific model
-                    paths = [p for p in paths if ep in p and 'rity_block' not in p]
-                    paths.sort(key= lambda x: x.rstrip(ep+'.npy'))  # ignore the epoch, otherwise alphabetical ordering
-                    # will get screwed up
-                else:
-                    paths = glob.glob(str(p.with_suffix(''))+'*') # grab all input rdms of a specific model
-
-                    condition = lambda p: True
-
-                    #TODO should end up with length 990
-                    # 6 * 10 * 11 = 660
-                    # + 3 (attended blocks) * 10 * 11 = 990
-
-                    # case: multiple blocks
-                    if 'block' not in str(p.with_suffix('')):
-                        # typically if block at the end, correct model is found,
-                        # if not: all rdms are found -> ignore those with blocks
-                        # (already contained)
-
-                        condition = lambda p: 'rity_block' not in p
-
-                        if 'epoch' not in str(p.with_suffix('')):
-                            condition = lambda p: 'epoch' not in p and 'rity_block' not in p
-
-                    else:
-                        # case: also epochs
-                        # there can be block at the end, without epoch, which would get all epochs
-                        if 'epoch' not in str(p.with_suffix('')):
-                            condition = lambda p: 'epoch' not in p
-
-                    paths = [p for p in paths if condition(p)]
-                    paths.sort()
+                    if len(paths) != 4:
+                        print("")
 
                 for path in paths:
                     rdms.append(np.load(path))
@@ -1388,12 +1373,13 @@ def rdms_from_paths(paths_, over_time=False):
             input_dissimilarities = evaluate_saved_model(
                 p.parent / 'model_checkpoints/checkpoint{}.chk'.format(epoch_str),
                 device, ModelClass=None,
-                input_dissimilarity=True,
+                input_dissimilarity=not intrinsic_dimension,
+                intrinsic_dimension=intrinsic_dimension,
                 block_n=block_n)
             assert len(input_dissimilarities) == 1 or 'without' not in str(p)
             for i, input_dissimilarity in enumerate(input_dissimilarities):
                 write_input_dissimilarity(p.parent.name, input_dissimilarity, att_block_n=i if i > 0 else None,
-                                          block_n=block_n, epoch_n=epoch_n)
+                                          block_n=block_n, epoch_n=epoch_n, intrinsic_dimension=intrinsic_dimension)
                 rdms.append(input_dissimilarity)
     return rdms
 
@@ -1495,10 +1481,15 @@ def plot_correlation_matrix_of_rdms_embedding(correlation_matrix_of_rdms, model_
     model_names = [create_label(name_model) for name_model in model_names]
 
     if all_blocks:
-        prefixes = ['B{} '.format(i+1) if i < 9 else '' for i in range(0, 10)]
-        model_names = [pre + mn for mn in model_names for pre in prefixes]
+        prefixes = ['B{} '.format(i+1) if i < 10 else '' for i in range(0, 10)]
     else:
         prefixes = ['']
+
+    if over_time:
+        times = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+        prefixes = [pre + 'E{} '.format(t) if t != -1 else pre for (pre, t) in itertools.product(prefixes, times)]
+
+    model_names = [pre + mn for mn in model_names for pre in prefixes]
 
     save_index_segnet_ls = []
     for pre in prefixes:
@@ -1527,6 +1518,19 @@ def plot_correlation_matrix_of_rdms_embedding(correlation_matrix_of_rdms, model_
     if embedding == 'mds':
         embedding = sklearn.manifold.MDS(n_components=2, dissimilarity='precomputed', random_state=1)
         mdm_transformed = embedding.fit_transform(correlation_matrix_of_rdms)
+
+        print("Relative error of embedding")
+        # http://www.mbfys.ru.nl/~robvdw/CNP04/LAB_ASSIGMENTS/LAB05_CN05/MATLAB2007b/stats/html/cmdscaledemo.html
+        # maxrelerr = max(abs(D - pdist(Y(:,1:2)))) / max(D)
+        from sklearn.metrics.pairwise import euclidean_distances
+        edists = euclidean_distances(mdm_transformed, mdm_transformed)
+        maxrelerr = np.max(np.abs(correlation_matrix_of_rdms - edists)) / correlation_matrix_of_rdms.max()
+        print("maxrelerr:", maxrelerr)
+        meanabserr = np.mean(np.abs(correlation_matrix_of_rdms - edists))
+        print("meanabserr:", meanabserr)
+        meanrelerr = np.mean(np.abs((correlation_matrix_of_rdms - edists) / (correlation_matrix_of_rdms + 1e-9)))
+        print("meanrelerr:", meanrelerr)
+
     elif embedding == 'tsne':
         append_name = '_'+embedding
         mdm_transformed = TSNE(n_components=2, metric='precomputed').fit_transform(correlation_matrix_of_rdms)
@@ -1536,11 +1540,22 @@ def plot_correlation_matrix_of_rdms_embedding(correlation_matrix_of_rdms, model_
         mdm_transformed = SpectralEmbedding(n_components=2, affinity='precomputed').\
             fit_transform(1-correlation_matrix_of_rdms)
         pass
+    elif embedding == 'umap':
+        append_name = '_'+embedding
+        mdm_transformed = UMAP(n_neighbors=50, random_state=42, metric='precomputed').fit_transform(
+            correlation_matrix_of_rdms)
+    elif embedding == 'som':
+        import sompy
+        # Not working and not that easy (no pairwise implementation available)
+        
+        append_name = '_'+embedding
+        som = sompy.SOMFactory.build(correlation_matrix_of_rdms, [35, 35])
+        som.train(n_job=1, verbose='info')
+        mdm_transformed = som.project_data(correlation_matrix_of_rdms)
     else:
         raise ValueError()
 
-
-    # TODO
+    # TODO number of rdms is correct, something with the model names
     df = pd.DataFrame(mdm_transformed, columns=['x', 'y'])
     df['name'] = model_names
     df['style'] = 0
@@ -1577,193 +1592,274 @@ def plot_correlation_matrix_of_rdms_embedding(correlation_matrix_of_rdms, model_
         df = df.replace('$RMSE$ $\\downarrow$', 'Depth $\\downarrow$')
 
     def name_to_alpha(name, start_alpha=0.2, blocks=10):
-        if name[0] == 'B':
+        if name[0] == 'B' and name[2] == ' ':
             alpha = start_alpha + (int(name[1])-1) * ((1.0-start_alpha)/(blocks-1))
             new_name = name[3:]
         else:
             alpha = 1.0
-            new_name = name
+            if name[0] == 'B':
+                new_name = name[4:]
+            else:
+                new_name = name
         return new_name, alpha
+
+    def name_to_epoch(name):
+        assert name[0] != 'B', 'Run name_to_alpha first'
+        assert name[0] == 'E', 'Every name has to contain a epoch'
+        splitted = name.split(' ')
+        ep = int(splitted[0][1:])
+        new_name = ' '.join(splitted[1:])
+
+        return new_name, ep
 
     vnta = np.vectorize(name_to_alpha)
     new_names, alphas = vnta(df.name.values)
     df.name = new_names
     df['alpha'] = alphas
 
-    # Set up the matplotlib figure
-    f, ax = plt.subplots(figsize=(5.5 * (1 if metrics is None else 3), 4.5))
-    if metrics is None:
+    plot_epochs = [None]
 
-        df['use'] = 1.
+    if over_time:
+        vnte = np.vectorize(name_to_epoch)
+        new_names, epochs = vnte(df.name.values)
+        df.name = new_names
+        df['epoch'] = epochs
 
-        markers = {
-            0: 'o',
-            1: 'X',
-            2: 's',
-            3: 'P',
-            4: 'D',
-            5: '^',
-            6: 'v',
-            7: 'p'
-        }
+        plot_epochs = np.unique(epochs)
 
-        palette = {
-            'Single Task': (0.12156862745098039, 0.4666666666666667, 0.7058823529411765),
-            'SN+EQ+A': (1.0, 0.4980392156862745, 0.054901960784313725),
-            'SNA+DWA+A (All Tasks)': (0.17254901960784313, 0.6274509803921569, 0.17254901960784313),
-            'SN+DWA+MTAHD': (0.8392156862745098, 0.15294117647058825, 0.1568627450980392)
-        }
+    for plot_epoch in plot_epochs:
+        # Set up the matplotlib figure
+        f, ax = plt.subplots(figsize=(5.5 * (1 if metrics is None else 3), 4.5))
+        if metrics is None:
 
-        xlim = (-0.56939660443679, 0.7341330811042694)
-        ylim = (-0.7031715957318339, 0.6853791830202742)
+            if plot_epoch != None:
+                df_p = df[df.epoch == plot_epoch]
+            else:
+                df_p = df
 
-        alphas = df.alpha.unique()
+            df_p['use'] = 1.
 
-        filter = True
-        draw_around_last = False
-        draw_connecting_lines = False
-        if filter:
-            # df.loc[df.name == 'Single Task', 'use'] = 0.
-            # df.loc[df.alpha > 0.6, 'use'] = 0.
-            # df.loc[df.alpha > alphas[1], 'use'] = 0.
-            df['ns'] = df.apply(lambda x: x['name'] + ' ' + str(x['style']), axis=1)
-            draw_around_last = True
-            draw_connecting_lines = True
-            print()
+            markers = {
+                0: 'o',
+                1: 'X',
+                2: 's',
+                3: 'P',
+                4: 'D',
+                5: '^',
+                6: 'v',
+                7: 'p'
+            }
 
-        if filter:
-            alpha = 0.
-            sc = sns.scatterplot(x='x', y='y', hue='name', style='style', data=df[df.alpha == alphas[0]], ax=ax,
-                                 legend='full', s=50 if not all_blocks else 20, alpha=alpha,
+            palette = {
+                'Single Task': (0.12156862745098039, 0.4666666666666667, 0.7058823529411765),
+                'SN+EQ+A': (1.0, 0.4980392156862745, 0.054901960784313725),
+                'SN+DWA+A': (1.0, 0.4980392156862745, 0.054901960784313725),
+                'SNA+DWA+A (All Tasks)': (0.17254901960784313, 0.6274509803921569, 0.17254901960784313),
+                'SN+DWA+MTAHD': (0.8392156862745098, 0.15294117647058825, 0.1568627450980392)
+            }
+
+            if embedding == 'mds':
+                xlim = (-0.56939660443679, 0.7341330811042694)
+                xlim = (-0.9, 0.7341330811042694)
+                ylim = (-0.7031715957318339, 0.8)
+                ylim = (-0.8, 0.85)
+            else:
+                borders = (mdm_transformed.max(axis=0) - mdm_transformed.min(axis=0)) * 0.05
+                mins = mdm_transformed.min(axis=0) - borders
+                maxs = mdm_transformed.max(axis=0) + borders
+                xlim = (mins[0], maxs[0])
+                ylim = (mins[1], maxs[1])
+
+
+            alphas = df_p.alpha.unique()
+
+            filter = True
+            draw_around_last = False
+            draw_connecting_lines = False
+            if filter:
+                # df_p.loc[df_p.name == 'Single Task', 'use'] = 0.
+                # df_p.loc[df_p.alpha > 0.6, 'use'] = 0.
+                # df_p.loc[df_p.alpha > alphas[1], 'use'] = 0.
+                df_p['ns'] = df_p.apply(lambda x: x['name'] + ' ' + str(x['style']), axis=1)
+                draw_around_last = True
+                draw_connecting_lines = False
+                print()
+
+            if filter:
+                alpha = 0.
+                sc = sns.scatterplot(x='x', y='y', hue='name', style='style', data=df_p[df_p.alpha == alphas[0]], ax=ax,
+                                     legend='full', s=50 if not all_blocks else 20, alpha=alpha,
+                                     markers=markers, palette=palette)
+
+            sc = sns.scatterplot(x='x', y='y', hue='name', style='style', data=df_p[(df_p.alpha == alphas[0]) & (df_p.use == 1.)],
+                                 ax=ax if not filter else sc,
+                                 legend='full' if not filter else None, s=50 if not all_blocks else 20, alpha=alphas[0],
                                  markers=markers, palette=palette)
 
-        sc = sns.scatterplot(x='x', y='y', hue='name', style='style', data=df[(df.alpha == alphas[0]) & (df.use == 1.)],
-                             ax=ax if not filter else sc,
-                             legend='full' if not filter else None, s=50 if not all_blocks else 20, alpha=alphas[0],
-                             markers=markers, palette=palette)
+            for alpha in alphas[1:]:
+                sns.scatterplot(x='x', y='y', hue='name', style='style', data=df_p[(df_p.alpha == alpha) & (df_p.use == 1.)], ax=sc,
+                                legend=None, s=50 if not all_blocks else 20, alpha=alpha,
+                                markers=markers, palette=palette)
 
-        for alpha in alphas[1:]:
-            sns.scatterplot(x='x', y='y', hue='name', style='style', data=df[(df.alpha == alpha) & (df.use == 1.)], ax=sc,
-                            legend=None, s=50 if not all_blocks else 20, alpha=alpha,
-                            markers=markers, palette=palette)
+            if draw_around_last:
+                alpha = alphas[-1]
+                last_in_df_p = df_p[(df_p.alpha == alpha) & (df_p.use == 1.)]
+                circle_rad = 5
+                sc.plot(last_in_df_p.x, last_in_df_p.y, 'o',
+                        ms=circle_rad * 2, mec='black', mfc='none', mew=1)
 
-        if draw_around_last:
-            alpha = alphas[-1]
-            last_in_df = df[(df.alpha == alpha) & (df.use == 1.)]
-            circle_rad = 5
-            sc.plot(last_in_df.x, last_in_df.y, 'o',
-                    ms=circle_rad * 2, mec='black', mfc='none', mew=1)
+            if draw_connecting_lines:
+                colors_ = [palette['Single Task']] * 3 + [palette['SN+EQ+A']] + [palette['SNA+DWA+A (All Tasks)']] * 4 + [
+                    palette['SN+DWA+MTAHD']]
+                for color_, ns in zip(colors_, df_p.ns.unique()):
+                    df_p_f = df_p[df_p.ns == ns]
+                    sc.plot(df_p_f.x, df_p_f.y, alpha=0.5, linewidth=0.5, color=color_)
+                print()
 
-        if draw_connecting_lines:
-            colors_ = [palette['Single Task']] * 3 + [palette['SN+EQ+A']] + [palette['SNA+DWA+A (All Tasks)']] * 4 + [
-                palette['SN+DWA+MTAHD']]
-            for color_, ns in zip(colors_, df.ns.unique()):
-                df_f = df[df.ns == ns]
-                sc.plot(df_f.x, df_f.y, alpha=0.5, linewidth=0.5, color=color_)
+            sc.set_xlim(*xlim)
+            sc.set_ylim(*ylim)
+
+            handles, labels = sc.get_legend_handles_labels()
+
+            handle_size = 20
+            newhandles = []
+            newlabels = []
+            for handle, label in zip(handles, labels):
+                if label != 'name' and label != 'style':
+                    handle._sizes[0] = handle_size
+                    newhandles.append(handle)
+                    newlabels.append(label)
+
+            changedhandles = []
+            changedlabels = []
+            for handle, label in zip(newhandles[-3:], newlabels[-3:]):
+                changedlabels.append(newlabels[0] + ' ' + label)
+                handle_copy = copy(handle)
+                handle_copy._edgecolors = newhandles[0]._edgecolors
+                handle_copy._facecolors = newhandles[0]._facecolors
+                changedhandles.append(handle_copy)
+
+            if save_index_segnet != -1:
+                found = False
+                for i, label in enumerate(newlabels):
+                    if 'SNA' in label:
+                        found = True
+                        index_segnet = i
+                assert found
+
+                changedhandles_segnet = []
+                changedlabels_segnet = []
+                for handle, label in zip(newhandles[-3:], newlabels[-3:]):
+                    changedlabels_segnet.append(newlabels[index_segnet].replace('(All Tasks)', '(Task {})'.format(label)))
+                    handle._edgecolors = newhandles[index_segnet]._edgecolors
+                    handle._facecolors = newhandles[index_segnet]._facecolors
+                    changedhandles_segnet.append(handle)
+
+                newhandles = newhandles[:index_segnet+1] + changedhandles_segnet + newhandles[index_segnet+1:]
+                newlabels = newlabels[:index_segnet+1] + changedlabels_segnet + newlabels[index_segnet+1:]
+
+            newhandles = changedhandles + newhandles[1:-4]
+            newlabels = changedlabels + newlabels[1:-4]
+
+
+
+            sc.legend().remove()
+            sc.set_xticks([])
+            sc.set_xticklabels([])
+            sc.set_xlabel('')
+            sc.set_yticks([])
+            sc.set_yticklabels([])
+            sc.set_ylabel('')
+            legend_cols = 4
+
+            if all_blocks:
+                newlabels = ['Specialist 1', 'Specialist 2', 'Specialist 3',
+                             'Attention All', 'Attention 1', 'Attention 2', 'Attention 3',
+                             'Tree-like', 'Tree-like + Gradient Mixing']
+
+            f.legend(handles=flip(newhandles, legend_cols), labels=flip(newlabels, legend_cols),
+                     ncol=legend_cols, loc='lower center')
             print()
 
-        sc.set_xlim(*xlim)
-        sc.set_ylim(*ylim)
+            plt.subplots_adjust(left=0.05, right=0.95, top=0.98, bottom=0.15)
+            plt.savefig('./plots/mdm_embedding{}{}.png'.format(append_name, '_epoch' + str(
+                plot_epoch) if plot_epoch != None else ''), dpi=300)
 
-        handles, labels = sc.get_legend_handles_labels()
-
-        handle_size = 20
-        newhandles = []
-        newlabels = []
-        for handle, label in zip(handles, labels):
-            if label != 'name' and label != 'style':
-                handle._sizes[0] = handle_size
-                newhandles.append(handle)
-                newlabels.append(label)
-
-        changedhandles = []
-        changedlabels = []
-        for handle, label in zip(newhandles[-3:], newlabels[-3:]):
-            changedlabels.append(newlabels[0] + ' ' + label)
-            handle_copy = copy(handle)
-            handle_copy._edgecolors = newhandles[0]._edgecolors
-            handle_copy._facecolors = newhandles[0]._facecolors
-            changedhandles.append(handle_copy)
-
-        if save_index_segnet != -1:
-            found = False
-            for i, label in enumerate(newlabels):
-                if 'SNA' in label:
-                    found = True
-                    index_segnet = i
-            assert found
-
-            changedhandles_segnet = []
-            changedlabels_segnet = []
-            for handle, label in zip(newhandles[-3:], newlabels[-3:]):
-                changedlabels_segnet.append(newlabels[index_segnet].replace('(All Tasks)', '(Task {})'.format(label)))
-                handle._edgecolors = newhandles[index_segnet]._edgecolors
-                handle._facecolors = newhandles[index_segnet]._facecolors
-                changedhandles_segnet.append(handle)
-
-            newhandles = newhandles[:index_segnet+1] + changedhandles_segnet + newhandles[index_segnet+1:]
-            newlabels = newlabels[:index_segnet+1] + changedlabels_segnet + newlabels[index_segnet+1:]
-
-        newhandles = changedhandles + newhandles[1:-4]
-        newlabels = changedlabels + newlabels[1:-4]
-
-
-
-        sc.legend().remove()
-        sc.set_xticks([])
-        sc.set_xticklabels([])
-        sc.set_xlabel('')
-        sc.set_yticks([])
-        sc.set_yticklabels([])
-        sc.set_ylabel('')
-        legend_cols = 4
-
-        if all_blocks:
-            newlabels = ['Specialist 1', 'Specialist 2', 'Specialist 3', 'Tree-like',
-                         'Attention All', 'Attention 1', 'Attention 2', 'Attention 3',
-                         'Tree-like + Gradient Mixing']
-
-        f.legend(handles=flip(newhandles, legend_cols), labels=flip(newlabels, legend_cols),
-                 ncol=legend_cols, loc='lower center')
-        print()
-
-        plt.subplots_adjust(left=0.05, right=0.95, top=0.98, bottom=0.15)
-        plt.savefig('./plots/mdm_embedding{}.png'.format(append_name), dpi=300)
-
-    else:
-        filled_markers = ('o', 'D', 'H', 'p', 'v', '^', '<', '>', 's', '8', 'd', 'P', 'X', '*')
-        labels = df.name.unique()
-
-        cmap = sns.color_palette("cubehelix", 8)
-        only_black = True
-        if only_black:
-            df.Value = 100.
-
-            g = sns.FacetGrid(df, col='Metric')
-            g.map_dataframe(sns.scatterplot, x='x', y='y', style='style', markers=filled_markers,
-                            cmap=cmap, s=50, legend='full').set_titles(
-                "{col_name}").add_legend(label_order=['0', '1', '2', '3', '4', '5', '6', '7', '8'])
         else:
-            g = sns.FacetGrid(df, col='Metric')
-            g.map_dataframe(sns.scatterplot, x='x', y='y', style='style', hue='Value', markers=filled_markers,
-                            cmap=cmap, s=50, legend='full').set_titles(
-                "{col_name}").add_legend(label_order=['0', '1', '2', '3', '4', '5', '6', '7', '8'])
+            filled_markers = ('o', 'D', 'H', 'p', 'v', '^', '<', '>', 's', '8', 'd', 'P', 'X', '*')
+            labels = df_p.name.unique()
 
-        for i in range(len(g._legend.texts)):
-            g._legend.texts[i].set_text(labels[i])
+            cmap = sns.color_palette("cubehelix", 8)
+            only_black = True
+            if only_black:
+                df_p.Value = 100.
 
-        for ax in g.axes.flat:
-            ax.set_xticks([])
-            ax.set_xticklabels([])
-            ax.set_xlabel('')
-            ax.set_yticks([])
-            ax.set_yticklabels([])
-            ax.set_ylabel('')
+                g = sns.FacetGrid(df_p, col='Metric')
+                g.map_dataframe(sns.scatterplot, x='x', y='y', style='style', markers=filled_markers,
+                                cmap=cmap, s=50, legend='full').set_titles(
+                    "{col_name}").add_legend(label_order=['0', '1', '2', '3', '4', '5', '6', '7', '8'])
+            else:
+                g = sns.FacetGrid(df_p, col='Metric')
+                g.map_dataframe(sns.scatterplot, x='x', y='y', style='style', hue='Value', markers=filled_markers,
+                                cmap=cmap, s=50, legend='full').set_titles(
+                    "{col_name}").add_legend(label_order=['0', '1', '2', '3', '4', '5', '6', '7', '8'])
 
-        plt.savefig('./plots/mdm_embedding_metrics.png', dpi=300)
+            for i in range(len(g._legend.texts)):
+                g._legend.texts[i].set_text(labels[i])
 
-    # sc.set_title('Models embedded by MDS based on MDM')
+            for ax in g.axes.flat:
+                ax.set_xticks([])
+                ax.set_xticklabels([])
+                ax.set_xlabel('')
+                ax.set_yticks([])
+                ax.set_yticklabels([])
+                ax.set_ylabel('')
+
+            plt.savefig(
+                './plots/mdm_embedding_metrics{}.png'.format('_epoch' + str(plot_epoch) if plot_epoch != None else ''),
+                dpi=300)
+
+        # sc.set_title('Models embedded by MDS based on MDM')
+        plt.show()
+
+
+def plot_cluster_tree(mdm, model_names):
+    from matplotlib import pyplot as plt
+    from scipy.cluster.hierarchy import dendrogram
+
+    def plot_dendrogram(model, **kwargs):
+        # Create linkage matrix and then plot the dendrogram
+
+        # create the counts of samples under each node
+        counts = np.zeros(model.children_.shape[0])
+        n_samples = len(model.labels_)
+        for i, merge in enumerate(model.children_):
+            current_count = 0
+            for child_idx in merge:
+                if child_idx < n_samples:
+                    current_count += 1  # leaf node
+                else:
+                    current_count += counts[child_idx - n_samples]
+            counts[i] = current_count
+
+        linkage_matrix = np.column_stack([model.children_, model.distances_,
+                                        counts]).astype(float)
+
+        # Plot the corresponding dendrogram
+        dendrogram(linkage_matrix, **kwargs)
+
+    # setting distance_threshold=0 ensures we compute the full tree.
+    model = myAggClustering.AgglomerativeClustering(distance_threshold=0, n_clusters=None, affinity='precomputed', linkage='average')
+
+    mdm = mdm[:10, :10]
+
+    model = model.fit(mdm)
+    plt.title('Hierarchical Clustering Dendrogram')
+    # plot the top three levels of the dendrogram
+    plot_dendrogram(model, truncate_mode=None)
+    plt.xlabel("Number of points in node (or index of point if no parenthesis.")
     plt.show()
+
 
 def plot_input_rdm(rdm):
     f = plt.figure()
@@ -1994,7 +2090,8 @@ if __name__ == '__main__':
                                   metrics,
                                   ncols=3, start_epoch=20, just_values=True, bar=bar)
     else: pass
-    # plot_metrics([model_name[0] for model_name in model_names], metrics, ncols=3)
+
+    # plot_metrics(['mtan_segnet_without_attention_dwa_multitask_adam_hd_run_5'], metrics, ncols=3)
 
     # TODO
     # plot_metrics(model_names_subsampled, metrics, ncols=3, subsampled=True, best_subsampled=True)
@@ -2007,10 +2104,24 @@ if __name__ == '__main__':
 
     reduce = False
     all_blocks = True
-    mdm = correlation_matrix_of_rdms_from_names(model_names, reduce=reduce, all_blocks=all_blocks,
+
+    intrinsic_dimension = True
+    if intrinsic_dimension:
+        intrinsic_dimensions = intrinsic_dimension_from_names(model_names, reduce=reduce, all_blocks=all_blocks,
                                                 over_time=rsa_during_learning)
+
+    testing_plot = False
+    if testing_plot:
+        mdm = np.load('./test_mdm.npy')
+    else:
+        mdm = correlation_matrix_of_rdms_from_names(model_names, reduce=reduce, all_blocks=all_blocks,
+                                                    over_time=rsa_during_learning)
     # plot_input_rdm(rdms_from_names(model_names, reduce=reduce)[0])
     # plot_correlation_matrix_of_rdms(mdm, model_names, reduce=reduce)
+
+    cluster_tree = False
+    if cluster_tree:
+        plot_cluster_tree(mdm, model_names)
 
     if bar:
         metrics = metrics_df[metrics_df['Metric'].isin(['$IoU$ $\\uparrow$', '$RMSE$ $\\downarrow$', '$MAD$ $\\downarrow$'])]
@@ -2038,7 +2149,7 @@ if __name__ == '__main__':
 
     plot_correlation_matrix_of_rdms_embedding(mdm, model_names, reduce=reduce, metrics=metrics, all_blocks=all_blocks,
                                               over_time=rsa_during_learning,
-                                              embedding='mds')
+                                              embedding='umap')
 
     input_dissimilarity = False
     # test_multitask_adam_mixing_hd_grads(CHECKPOINT_PATH, device, ModelClass=architectures.SegNetWithoutAttention)
